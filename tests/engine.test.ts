@@ -396,6 +396,7 @@ describe('study sessions', () => {
       check(await h.send({ action: `lesson:${lesson.id}` }));
       const original = await h.session();
       for (let index = 0; index < original.steps.length; index++) {
+        if (original.steps[index]?.kind === 'question') check(await h.send({ action: `reading:${original.id}:${index}` }));
         check(await h.send({ action: `hint:${original.id}:${index}` }));
         check(await h.answer(index % 2 === 0));
         check(await h.next());
@@ -405,7 +406,7 @@ describe('study sessions', () => {
       }
     }
     expect((await h.state())?.completedLessons).toHaveLength(h.course.lessons.length);
-  }, 90_000); // Exhaustive rendering covers the entire imported corpus, including every explanation.
+  }, 180_000); // Exhaustive rendering covers the whole expanded course and both forms of reading help.
 });
 
 describe('33-question examination', () => {

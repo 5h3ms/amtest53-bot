@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { loadCourse, validateCourse } from '../src/course.js';
+import { loadCourse, validateCourse, examLessons, examVocabulary } from '../src/course.js';
 
 describe('published starter course', () => {
   it('loads the actual bank with source attribution and enough material for the pilot', () => {
     const course = loadCourse();
     expect(course.version).toContain('authored_training');
-    expect(course.questions.length).toBeGreaterThanOrEqual(40);
+    expect(course.questions.length).toBeGreaterThanOrEqual(120);
     expect(course.vocabulary.length).toBeGreaterThanOrEqual(60);
     expect(course.lessons.length).toBeGreaterThanOrEqual(10);
     expect(course.noticeRu).toMatch(/авторск/i);
@@ -18,6 +18,7 @@ describe('published starter course', () => {
       expect(question.options).toHaveLength(4);
       expect(question.promptHy).toMatch(/[\u0530-\u058f]/);
       expect(question.promptRu).toMatch(/[А-Яа-яЁё]/);
+      expect(question.readingHelp?.length).toBeGreaterThanOrEqual(2);
     }
   });
 
@@ -25,6 +26,29 @@ describe('published starter course', () => {
     const course = loadCourse();
     expect(new Set(course.lessons.flatMap(lesson => lesson.questionIds))).toEqual(new Set(course.questions.map(question => question.id)));
     expect(new Set(course.lessons.flatMap(lesson => lesson.vocabularyIds))).toEqual(new Set(course.vocabulary.map(word => word.id)));
+  });
+
+  it('covers every question in the exam path while keeping the general dictionary separate', () => {
+    const course = loadCourse();
+    const path = examLessons(course), words = examVocabulary(course);
+    expect(path.length).toBeGreaterThan(10);
+    expect(path.every(lesson => lesson.examTrack)).toBe(true);
+    expect(new Set(path.flatMap(lesson => lesson.questionIds))).toEqual(new Set(course.questions.map(question => question.id)));
+    expect(words.length).toBeGreaterThan(60);
+    expect(words.length).toBeLessThan(course.vocabulary.length);
+    for (const question of course.questions) {
+      expect(question.vocabularyIds.every(id => words.some(word => word.id === id))).toBe(true);
+    }
+    expect(course.lessons.filter(lesson => lesson.id.startsWith('lex_')).every(lesson => lesson.examTrack === false)).toBe(true);
+  });
+
+  it('recognizes legacy exam lessons without requiring metadata and respects an explicit opt-out', () => {
+    const course = loadCourse();
+    course.lessons.forEach(lesson => { delete lesson.examTrack; });
+    expect(examLessons(course).every(lesson => lesson.questionIds.length > 0)).toBe(true);
+    const excluded = course.lessons.find(lesson => lesson.questionIds.length > 0)!;
+    excluded.examTrack = false;
+    expect(examLessons(course).some(lesson => lesson.id === excluded.id)).toBe(false);
   });
 
   it('accepts vocabulary-only lessons and preserves the supported vocabulary categories', () => {
