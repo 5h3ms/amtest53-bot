@@ -241,7 +241,7 @@ export class LearningEngine {
       .map(category => button(CATEGORY_LABELS[category], `menu:${category}`));
     if (categories.length) rows.splice(2, 0, categories);
     if (user.session && user.session.endedAt === null) rows.unshift([button('Продолжить занятие', 'menu:continue')]);
-    return { text: `Армянский для теста на гражданство\n\nЧитаем вопросы, учим лексику и разбираем ответы. Алфавита и аудио нет.\n\n${this.course.noticeRu}`, buttons: rows };
+    return { text: `Армянский для теста на гражданство\n\nЧитаем вопросы, учим лексику и разбираем ответы.\n\n${this.course.noticeRu}`, buttons: rows };
   }
   private lessons(user: UserState, requestedPage: string): MessageView {
     const pages = Math.ceil(this.course.lessons.length / LESSONS_PER_PAGE);
