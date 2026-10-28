@@ -1,15 +1,16 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { Course, Question, Vocabulary } from './course.js';
 import { examLessons, examVocabulary } from './course.js';
 import type { StateStore } from './storage.js';
 import { selectWordDistractors } from './vocabulary-choices.js';
 import { updateQuestionProgress, selectPracticeQuestions, topicProgress, type QuestionProgress } from './question-review.js';
-import { recordUsage, aggregateUsage, renderStats, type UsageAnalytics } from './analytics.js';
+import { recordUsage, type UsageAnalytics } from './analytics.js';
+import { AdminReports } from './admin-reports.js';
 import { beginFeedback, chooseFeedbackCategory, pendingFeedback, cancelFeedback, submitFeedback,
-  collectReports, renderReportPage, FEEDBACK_CATEGORY_LABELS, type FeedbackState } from './feedback.js';
+  FEEDBACK_CATEGORY_LABELS, type FeedbackState } from './feedback.js';
 
 export interface MessageView { text: string; buttons?: Array<Array<{ text: string; data: string }>> }
-export interface PendingDelivery { id: string; userId: number; chatId: number; view: MessageView }
+export interface PendingDelivery { id: string; userId: number; chatId: number; view: MessageView; leaseToken?: string; leaseUntil?: number }
 export interface BotEvent { userId: number; chatId: number; eventId: string; text?: string; action?: string; now?: number }
 type Step = { kind: 'word'; word: Vocabulary; choices: string[]; correctIndex: number }
   | { kind: 'question'; question: Question };
@@ -22,7 +23,7 @@ export interface StudySession {
   startedAt: number; deadlineAt: number | null; endedAt: number | null;
 }
 interface CardProgress { level: number; dueAt: number; seen: number; mistakes: number }
-interface DeliveryRecord extends PendingDelivery { leaseUntil: number; createdAt: number; expiresAt: number | null }
+interface DeliveryRecord extends PendingDelivery { leaseUntil: number; createdAt: number; expiresAt: number | null; retryAt?: number }
 interface ExamResult { at: number; score: number; total: number; timedOut: boolean; version: string }
 export interface UserState {
   schema: 1; userId: number; chatId: number; createdAt: number; updatedAt: number;
@@ -78,27 +79,38 @@ export class LearningEngine {
   private readonly allowed: Set<number>;
   private readonly admins: Set<number>;
   private readonly accessMode: 'private' | 'public';
-  constructor(options: { store: StateStore; course: Course; allowedUserIds: number[]; adminUserIds: number[]; accessMode?: 'private' | 'public' }) {
+  private readonly adminReports: AdminReports;
+  private readonly requireMaintenanceIndexReady: boolean;
+  constructor(options: { store: StateStore; course: Course; allowedUserIds: number[]; adminUserIds: number[]; accessMode?: 'private' | 'public'; requireMaintenanceIndexReady?: boolean }) {
     this.store = options.store; this.course = options.course;
     this.allowed = new Set([...options.allowedUserIds, ...options.adminUserIds]);
     this.admins = new Set(options.adminUserIds);
     this.accessMode = options.accessMode ?? 'private';
+    this.adminReports = new AdminReports({ store: options.store, course: options.course });
+    this.requireMaintenanceIndexReady = options.requireMaintenanceIndexReady ?? false;
   }
   private canAccess(userId: number): boolean {
     return Number.isSafeInteger(userId) && userId > 0 && (this.accessMode === 'public' || this.allowed.has(userId));
   }
-  async handle(event: BotEvent): Promise<PendingDelivery[]> {
+  async handle(event: BotEvent, reserveDelivery = false): Promise<PendingDelivery[]> {
     if (!this.canAccess(event.userId) || event.chatId !== event.userId) return [];
     const now = event.now ?? Date.now();
     if (!Number.isFinite(now) || !event.eventId || event.eventId.length > 100) throw new Error('Invalid event');
     const command = inputText(event.text).split('@')[0];
-    const adminRequest = command === '/stats' || command === '/reports' || event.action?.startsWith('admin:');
-    const users = adminRequest && this.admins.has(event.userId) ? await this.registeredUsers() : undefined;
+    const adminAction = event.action?.startsWith('admin:') ? event.action
+      : command === '/stats' ? 'admin:stats' : command === '/reports' ? 'admin:reports:0' : undefined;
+    let adminView: MessageView | undefined;
+    if (adminAction && this.admins.has(event.userId)) {
+      const existing = await this.store.read(key(event.userId));
+      adminView = await this.adminReports.view(adminAction, now, existing === null ? initial(event.userId, event.chatId, now) : parseState(existing));
+    }
+    // Generated once outside the transaction callback: retries keep a stable owner token.
+    const deliveryToken = reserveDelivery ? randomUUID() : undefined;
     return this.store.update(key(event.userId), raw => {
       const user = raw === null ? initial(event.userId, event.chatId, now) : parseState(raw);
       if (user.userId !== event.userId || user.chatId !== event.chatId) return { state: user, result: [] };
       this.pruneReminders(user, now);
-      if (user.processedEvents.includes(event.eventId)) return { state: user, result: this.pending(user) };
+      if (user.processedEvents.includes(event.eventId)) return { state: user, result: this.deliveries(user, now, deliveryToken) };
       user.updatedAt = now; user.blocked = false;
       user.analytics = recordUsage(user.analytics, { kind: 'active' }, now);
       let view: MessageView;
@@ -108,16 +120,16 @@ export class LearningEngine {
           (pendingFeedback(user.feedback, now) && inputText(event.text) && !inputText(event.text).startsWith('/'));
         view = feedbackInput ? this.routeFeedback(user, event, now) ?? this.renderSession(user) : this.renderSession(user);
       } else {
-        view = this.route(user, event, now, users);
+        view = this.route(user, event, now, adminView);
       }
       this.pruneReminders(user, now);
       user.processedEvents.push(event.eventId);
       user.processedEvents = user.processedEvents.slice(-200);
       this.enqueue(user, `event_${event.eventId}`, view, now);
-      return { state: user, result: this.pending(user) };
+      return { state: user, result: this.deliveries(user, now, deliveryToken) };
     });
   }
-  async claim(userId: number, id: string): Promise<boolean> {
+  async claim(userId: number, id: string, leaseToken?: string, expectedToken?: string): Promise<boolean> {
     if (!this.canAccess(userId)) return false;
     return this.store.update(key(userId), raw => {
       if (raw === null) return { state: null, result: false };
@@ -126,23 +138,31 @@ export class LearningEngine {
       this.pruneReminders(user, now);
       const item = user.outbox.find(x => x.id === id);
       if (user.blocked) return { state: user, result: false };
-      if (!item || item.userId !== userId || item.chatId !== userId || item.leaseUntil > now) return { state: user, result: false };
+      if (!item || item.userId !== userId || item.chatId !== userId || (item.retryAt ?? 0) > now ||
+        (item.leaseUntil > now && (!expectedToken || item.leaseToken !== expectedToken))) return { state: user, result: false };
       item.leaseUntil = now + 30_000;
+      if (leaseToken) item.leaseToken = leaseToken; else delete item.leaseToken;
+      delete item.retryAt;
       return { state: user, result: true };
     });
   }
-  async acknowledge(userId: number, id: string): Promise<void> {
+  async acknowledge(userId: number, id: string, leaseToken?: string): Promise<void> {
     await this.store.update(key(userId), raw => {
       if (raw === null) return { state: null, result: undefined };
-      const user = parseState(raw); user.outbox = user.outbox.filter(x => x.id !== id);
+      const user = parseState(raw);
+      user.outbox = user.outbox.filter(x => x.id !== id || x.leaseToken !== leaseToken);
       return { state: user, result: undefined };
     });
   }
-  async release(userId: number, id: string): Promise<void> {
+  async release(userId: number, id: string, leaseToken?: string): Promise<void> {
+    const now = Date.now();
     await this.store.update(key(userId), raw => {
       if (raw === null) return { state: null, result: undefined };
       const user = parseState(raw), item = user.outbox.find(x => x.id === id);
-      if (item) item.leaseUntil = 0;
+      if (item && item.leaseToken === leaseToken) {
+        item.leaseUntil = 0; delete item.leaseToken;
+        if (leaseToken) item.retryAt = now + 60_000; else delete item.retryAt;
+      }
       return { state: user, result: undefined };
     });
   }
@@ -155,17 +175,33 @@ export class LearningEngine {
   }
   async maintenance(now = Date.now()): Promise<PendingDelivery[]> {
     const pending: PendingDelivery[] = [];
-    if (this.accessMode === 'private') {
-      // A revoked private participant receives no scheduled deliveries.
-      for (const userId of this.allowed) pending.push(...await this.maintainUser(userId, now));
-      return pending;
+    if (this.requireMaintenanceIndexReady) {
+      const marker = await this.store.read('meta_maintenance_index_v1') as { ready?: boolean } | null;
+      // During the one-time rollout, old documents may still have no scheduling metadata.
+      // Keep servicing them until a verified backfill publishes the readiness marker.
+      if (marker?.ready !== true) return this.maintenanceBeforeBackfill(now);
     }
+    let after: { at: number; key: string } | undefined;
+    while (true) {
+      const page = await this.store.listDuePage(now, { after, limit: 100 });
+      for (const record of page.records) {
+        const user = this.registeredUser(record.state, record.key);
+        if (user) pending.push(...await this.maintainUser(user.userId, now));
+      }
+      if (page.nextCursor === null) break;
+      const cursor = page.nextCursor;
+      if (after && (cursor.at < after.at || (cursor.at === after.at && cursor.key <= after.key))) throw new Error('Invalid due page cursor');
+      after = cursor;
+    }
+    return pending;
+  }
+  private async maintenanceBeforeBackfill(now: number): Promise<PendingDelivery[]> {
+    const pending: PendingDelivery[] = [];
     let afterKey: string | undefined;
     while (true) {
       const page = await this.store.listPage('u_', { afterKey, limit: 100 });
       for (const record of page.records) {
         const user = this.registeredUser(record.state, record.key);
-        // Read-only snapshots avoid a transaction/write for every idle registered user.
         if (user && this.needsMaintenance(user, now)) pending.push(...await this.maintainUser(user.userId, now));
       }
       if (page.nextCursor === null) break;
@@ -232,68 +268,23 @@ export class LearningEngine {
     return user.outbox.filter(item => item.userId === user.userId && item.chatId === user.userId)
       .map(({ id, userId, chatId, view }) => ({ id, userId, chatId, view }));
   }
+  private deliveries(user: UserState, now: number, token?: string): PendingDelivery[] {
+    if (!token) return this.pending(user);
+    if (user.blocked) return [];
+    const ready = user.outbox.filter(item => item.userId === user.userId && item.chatId === user.chatId &&
+      item.leaseUntil <= now && (item.retryAt ?? 0) <= now);
+    const first = ready[0];
+    if (first) {
+      first.leaseToken = token; first.leaseUntil = now + 60_000; delete first.retryAt;
+    }
+    // Only the first queued delivery is reserved ahead of sending. A large backlog
+    // must acquire each remaining lease immediately before its network request.
+    return ready.map((item, index) => ({ id: item.id, userId: item.userId, chatId: item.chatId, view: item.view,
+      ...(index === 0 ? { leaseToken: token, leaseUntil: item.leaseUntil } : {}) }));
+  }
   private pruneReminders(user: UserState, now: number): void {
     user.outbox = user.outbox.filter(item => !item.id.startsWith('reminder_') ||
       (user.reminders.enabled && item.expiresAt != null && now < item.expiresAt));
-  }
-  private async registeredUsers(): Promise<UserState[]> {
-    const users: UserState[] = [];
-    let afterKey: string | undefined;
-    do {
-      const page = await this.store.listPage('u_', { afterKey, limit: 100 });
-      for (const record of page.records) {
-        if (record.state === null) continue;
-        const user = parseState(record.state);
-        if (Number.isSafeInteger(user.userId) && user.userId > 0 && user.chatId === user.userId &&
-          record.key === key(user.userId) && Number.isFinite(user.updatedAt)) {
-          // Administrative reports need counters, not every saved lesson and delivery payload.
-          users.push({ ...user, session: null, outbox: [], processedEvents: [] });
-        }
-      }
-      if (page.nextCursor === null) return users;
-      if (afterKey !== undefined && page.nextCursor <= afterKey) throw new Error('Invalid administrator page cursor');
-      afterKey = page.nextCursor;
-    } while (true);
-  }
-  private adminView(user: UserState, action: string, records: UserState[], now: number): MessageView {
-    const users = [...records.filter(record => record.userId !== user.userId), user];
-    const navigation = [[button('Статистика', 'admin:stats'), button('Участники', 'admin:users:0')],
-      [button('Выбор вариантов', 'admin:questions:0'), button('Ошибки в заданиях', 'admin:reports:0')], menuButton];
-    if (action.startsWith('admin:questions:')) {
-      const questions = aggregateUsage(users, now).questions;
-      if (!questions.length) return { text: 'Ответов на вопросы с начала сбора ещё нет.', buttons: navigation };
-      const requested = Number(action.split(':')[2]);
-      const page = Number.isSafeInteger(requested) ? Math.max(0, Math.min(requested, questions.length - 1)) : 0;
-      const question = questions[page]!;
-      const options = Object.values(question.options).sort((a, b) => b.count - a.count)
-        .map(option => `${option.correct ? '✓' : '•'} ${option.text}: ${option.count}/${question.answers}`);
-      const pages = [];
-      if (page > 0) pages.push(button('← Назад', `admin:questions:${page - 1}`));
-      if (page + 1 < questions.length) pages.push(button('Дальше →', `admin:questions:${page + 1}`));
-      return { text: `Выбор вариантов · ${page + 1}/${questions.length}\n${question.id}\nВерсия: ${question.version}\n\n${question.prompt}\n\nОтветов: ${question.answers}; правильно: ${question.correct}; с подсказкой: ${question.hintedAnswers}\n${options.join('\n')}\n\nПорядок кнопок не влияет на счётчики. Данные относятся к сохранённой версии вопроса с начала её сбора; старые записи могут вытесняться.`,
-        buttons: [...(pages.length ? [pages] : []), ...navigation] };
-    }
-    if (action.startsWith('admin:reports:')) {
-      const rendered = renderReportPage(collectReports(users), Number(action.split(':')[2]));
-      const pages = [];
-      if (rendered.page > 0) pages.push(button('← Назад', `admin:reports:${rendered.page - 1}`));
-      if (rendered.page + 1 < rendered.pages) pages.push(button('Дальше →', `admin:reports:${rendered.page + 1}`));
-      return { text: rendered.text, buttons: [...(pages.length ? [pages] : []), ...navigation] };
-    }
-    if (action.startsWith('admin:users:')) {
-      const pages = Math.max(1, Math.ceil(users.length / 5)), requested = Number(action.split(':')[2]);
-      const page = Number.isSafeInteger(requested) ? Math.max(0, Math.min(requested, pages - 1)) : 0;
-      const lessons = examLessons(this.course);
-      const lines = users.sort((a, b) => b.updatedAt - a.updatedAt).slice(page * 5, (page + 1) * 5).map(record => {
-        const topics = topicProgress(this.course, record.questionProgress ?? {}, now);
-        return `ID ${record.userId}\nУроки маршрута: ${lessons.filter(lesson => record.completedLessons.includes(lesson.id)).length}/${lessons.length}; слов в работе: ${Object.keys(record.cards).length}\nВопросы освоены: ${topics.reduce((sum, topic) => sum + topic.mastered, 0)}/${this.course.questions.length}; повторить: ${topics.reduce((sum, topic) => sum + topic.due, 0)}\nПоследняя активность: ${new Date(record.updatedAt).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
-      });
-      const pageButtons = [];
-      if (page > 0) pageButtons.push(button('← Назад', `admin:users:${page - 1}`));
-      if (page + 1 < pages) pageButtons.push(button('Дальше →', `admin:users:${page + 1}`));
-      return { text: `Участники · ${page + 1}/${pages}\n\n${lines.join('\n\n')}`, buttons: [...(pageButtons.length ? [pageButtons] : []), ...navigation] };
-    }
-    return { text: renderStats(aggregateUsage(users, now)), buttons: navigation };
   }
   private feedbackPrompt(user: UserState, now: number): MessageView {
     const pending = pendingFeedback(user.feedback, now);
@@ -353,15 +344,15 @@ export class LearningEngine {
     user.outbox = user.outbox.filter(x => x.id !== id).slice(-(MAX_OUTBOX - 1));
     user.outbox.push({ id, userId: user.userId, chatId: user.chatId, view, createdAt: now, leaseUntil: 0, expiresAt });
   }
-  private route(user: UserState, event: BotEvent, now: number, users?: UserState[]): MessageView {
+  private route(user: UserState, event: BotEvent, now: number, adminView?: MessageView): MessageView {
     const text = inputText(event.text);
     const command = text.split('@')[0];
     const adminAction = event.action?.startsWith('admin:') ? event.action
       : command === '/stats' ? 'admin:stats' : command === '/reports' ? 'admin:reports:0' : undefined;
     const feedbackView = this.routeFeedback(user, event, now);
     if (feedbackView) return feedbackView;
-    if (adminAction) return this.admins.has(user.userId) && users
-      ? this.adminView(user, adminAction, users, now)
+    if (adminAction) return this.admins.has(user.userId) && adminView
+      ? adminView
       : { text: 'Эта команда доступна только администратору.', buttons: [menuButton] };
     if (text.startsWith('/remind ')) return this.setReminder(user, text, now);
     if (text === '/privacy') return { text: 'Бот хранит ваш Telegram ID, настройки, учебный прогресс и результаты. Дневная статистика показывается за 90 дней; более старые счётчики удаляются при следующем обновлении записи. Детализация выбора ответов ограничена объёмом и максимум 200 версиями вопросов, старые записи могут вытесняться. Отправленные через «Ошибка в задании» описания видит владелец: хранятся последние 20 сообщений каждого пользователя. Остальные тексты сообщений не сохраняются как переписка. Данные не публикуются в GitHub. /reset очищает учебный прогресс; статистика использования и отправленные сообщения об ошибках сохраняются. Для полного удаления данных обратитесь к владельцу бота.', buttons: [menuButton] };

@@ -1,10 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { deleteApp, initializeApp, type App } from "firebase-admin/app";
 import { FieldPath, getFirestore, type Firestore } from "firebase-admin/firestore";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { loadCourse } from "../src/course.js";
 import { LearningEngine, type UserState } from "../src/engine.js";
 import { FirestoreStateStore, type StateStore } from "../src/storage.js";
+import { deliverPending } from '../src/telegram.js';
+import type { Bot } from 'grammy';
+import { backfillMaintenanceIndex, MAINTENANCE_READY_KEY } from '../src/maintenance-migration.js';
 
 const emulatorHost = process.env.FIRESTORE_EMULATOR_HOST;
 const projectId = process.env.GCLOUD_PROJECT;
@@ -19,6 +22,8 @@ describe.skipIf(!safeEmulator)("Firestore state store (local demo emulator only)
   let db: Firestore;
   let store: FirestoreStateStore;
   const prefix = `test_${randomUUID().replaceAll("-", "")}_`;
+  const ownedUserKeys: string[] = [];
+  let ownsMigrationMarker = false;
 
   beforeAll(() => {
     app = initializeApp({ projectId: projectId! }, `storage-test-${randomUUID()}`);
@@ -38,6 +43,8 @@ describe.skipIf(!safeEmulator)("Firestore state store (local demo emulator only)
       for (const record of records.docs.slice(offset, offset + 500)) batch.delete(record.ref);
       await batch.commit();
     }
+    for (const key of ownedUserKeys) await db.collection('botState').doc(key).delete();
+    if (ownsMigrationMarker) await db.collection('botState').doc(MAINTENANCE_READY_KEY).delete();
     await deleteApp(app);
   });
 
@@ -53,6 +60,78 @@ describe.skipIf(!safeEmulator)("Firestore state store (local demo emulator only)
       ),
     );
     expect((await store.list(key))[0]?.state).toEqual({ count: 5 });
+  }, 30_000);
+
+  it('indexes pending work atomically, uses two transactions for delivery and does not rewrite a duplicate', async () => {
+    const userId = Date.now() * 1000 + 1;
+    const userKey = `u_${userId}`; ownedUserKeys.push(userKey);
+    const engine = new LearningEngine({ store, course: loadCourse(), accessMode: 'private', allowedUserIds: [userId], adminUserIds: [] });
+    const event = { userId, chatId: userId, eventId: `cost-${randomUUID()}`, text: '/start' };
+    const transaction = vi.spyOn(db, 'runTransaction');
+    const [delivery] = await engine.handle(event, true);
+    expect(delivery?.leaseToken).toEqual(expect.any(String));
+    const before = (await db.collection('botState').doc(userKey).get()).data()!;
+    expect(before.maintenanceIndexVersion).toBe(1);
+    expect(before.nextMaintenanceAt).toBe(delivery!.leaseUntil);
+    expect((await store.listDuePage(Date.now())).records.some(record => record.key === userKey)).toBe(false);
+    const bot = { api: { sendMessage: vi.fn().mockResolvedValue({ message_id: 1 }) } };
+    await deliverPending(bot as unknown as Bot, engine, [delivery!]);
+    expect(transaction).toHaveBeenCalledTimes(2);
+    transaction.mockRestore();
+    const acknowledged = await db.collection('botState').doc(userKey).get();
+    expect(acknowledged.data()!.nextMaintenanceAt).toBeNull();
+    expect(await engine.handle(event, true)).toEqual([]);
+    const duplicate = await db.collection('botState').doc(userKey).get();
+    expect(duplicate.updateTime!.isEqual(acknowledged.updateTime!)).toBe(true);
+    expect(bot.api.sendMessage).toHaveBeenCalledOnce();
+  }, 30_000);
+
+  it('queries only due users with stable time-and-ID cursors and reads user pages backwards', async () => {
+    const firstId = Date.now() * 1000 + 10, now = Date.now();
+    const engine = new LearningEngine({ store, course: loadCourse(), accessMode: 'public', allowedUserIds: [], adminUserIds: [] });
+    const deliveries = [];
+    for (let index = 0; index < 4; index++) {
+      const userId = firstId + index; ownedUserKeys.push(`u_${userId}`);
+      const [delivery] = await engine.handle({ userId, chatId: userId, eventId: `due-${index}`, text: '/start', now });
+      deliveries.push(delivery!);
+      if (index === 3) await engine.acknowledge(userId, delivery!.id);
+    }
+    const seen: string[] = []; let after: { at: number; key: string } | undefined;
+    do {
+      const page = await store.listDuePage(now, { after, limit: 1 });
+      seen.push(...page.records.map(record => record.key));
+      if (page.nextCursor === null) break;
+      after = page.nextCursor;
+    } while (true);
+    expect(seen.filter(key => ownedUserKeys.includes(key))).toEqual(deliveries.slice(0, 3).map(delivery => `u_${delivery.userId}`));
+    const reverse = await store.listPage('u_', { beforeKey: `u_${firstId + 3}`, limit: 2 });
+    expect(reverse.records.map(record => record.key)).toEqual([`u_${firstId + 1}`, `u_${firstId + 2}`]);
+    for (const delivery of deliveries) await engine.acknowledge(delivery.userId, delivery.id);
+  }, 30_000);
+
+  it('backfills real legacy documents without rewriting JSON and activates only after verification', async () => {
+    const userId = Date.now() * 1000 + 20, userKey = `u_${userId}`;
+    ownedUserKeys.push(userKey); ownsMigrationMarker = true;
+    const engine = new LearningEngine({ store, course: loadCourse(), accessMode: 'private', allowedUserIds: [userId], adminUserIds: [] });
+    await engine.handle({ userId, chatId: userId, eventId: 'legacy-migration', text: '/start' });
+    const reference = db.collection('botState').doc(userKey);
+    const original = (await reference.get()).data()!;
+    // Model the previous envelope exactly, retaining even its JSON formatting.
+    const stateJson = JSON.stringify(JSON.parse(original.stateJson as string), null, 2);
+    await reference.set({ key: userKey, version: 1, stateJson });
+    const dry = await backfillMaintenanceIndex(db, { apply: false });
+    expect(dry.updated).toBeGreaterThanOrEqual(1);
+    expect(dry.readyPublished).toBe(false);
+    expect((await reference.get()).data()!.stateJson).toBe(stateJson);
+    const applied = await backfillMaintenanceIndex(db, { apply: true });
+    expect(applied).toMatchObject({ invalid: 0, missing: 0, verificationInvalid: 0, verificationMissing: 0, readyPublished: true });
+    const indexed = (await reference.get()).data()!;
+    expect(indexed.stateJson).toBe(stateJson);
+    expect(indexed.maintenanceIndexVersion).toBe(1);
+    expect(typeof indexed.nextMaintenanceAt).toBe('number');
+    const repeat = await backfillMaintenanceIndex(db, { apply: true });
+    expect(repeat.updated).toBe(0);
+    expect(repeat.readyPublished).toBe(true);
   }, 30_000);
 
   it("supports atomic deduplication of a repeated Telegram update", async () => {
@@ -89,6 +168,9 @@ describe.skipIf(!safeEmulator)("Firestore state store (local demo emulator only)
 
   it("persists engine sessions, analytics and feedback without counting retried answers twice", async () => {
     const namespacedStore: StateStore = {
+      read: key => store.read(`${prefix}${key}`),
+      delete: key => store.delete(`${prefix}${key}`),
+      listDuePage: (now, options) => store.listDuePage(now, options),
       update: (key, fn) => store.update(`${prefix}${key}`, fn),
       list: async filter => (await store.list(`${prefix}${filter}`))
         .map(record => ({ key: record.key.slice(prefix.length), state: record.state })),

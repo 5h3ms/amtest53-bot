@@ -642,7 +642,7 @@ describe('public access', () => {
     expect(await h.engine.maintenance(Date.parse('2026-10-28T15:00:00Z'))).toEqual([]);
   });
 
-  it('discovers reminders on pages after the first 100 registered users and avoids transactions for idle users', async () => {
+  it('queries due reminders without scanning the other registered users', async () => {
     const h = harness(loadCourse(), 'public');
     h.restart([], []);
     for (let userId = 1000; userId < 1105; userId++) {
@@ -652,12 +652,13 @@ describe('public access', () => {
       await h.send({ userId, chatId: userId, text: '/remind 19:00 Asia/Yerevan' });
     }
     const pages = vi.spyOn(h.store, 'listPage');
+    const duePages = vi.spyOn(h.store, 'listDuePage');
     const transactions = vi.spyOn(h.store, 'update');
     const at = Date.parse('2026-10-28T15:00:00Z');
     const pending = await h.engine.maintenance(at);
-    expect(pages).toHaveBeenCalledTimes(2);
-    expect(pages).toHaveBeenNthCalledWith(1, 'u_', { afterKey: undefined, limit: 100 });
-    expect(pages).toHaveBeenNthCalledWith(2, 'u_', { afterKey: 'u_1099', limit: 100 });
+    expect(pages).not.toHaveBeenCalled();
+    expect(duePages).toHaveBeenCalledOnce();
+    expect(duePages).toHaveBeenCalledWith(at, { after: undefined, limit: 100 });
     expect(transactions).toHaveBeenCalledTimes(2);
     expect(pending.map(item => item.userId)).toEqual([1000, 1104]);
     expect(pending.every(item => item.chatId === item.userId && item.id === 'reminder_2026-10-28')).toBe(true);
@@ -708,9 +709,9 @@ describe('public access', () => {
     const h = harness(loadCourse(), 'public');
     h.restart([], []);
     await h.send({ userId: 701, chatId: 701, text: '/remind 19:00 Asia/Yerevan' });
-    const listPage = h.store.listPage.bind(h.store);
-    vi.spyOn(h.store, 'listPage').mockImplementationOnce(async (prefix, options) => {
-      const page = await listPage(prefix, options);
+    const listPage = h.store.listDuePage.bind(h.store);
+    vi.spyOn(h.store, 'listDuePage').mockImplementationOnce(async (time, options) => {
+      const page = await listPage(time, options);
       await h.store.update('u_701', raw => {
         const user = raw as UserState;
         user.reminders.enabled = false;

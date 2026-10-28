@@ -48,7 +48,7 @@ describe('Telegram delivery reliability', () => {
       return { message_id: 42 };
     });
     await deliverPending(bot as unknown as Bot, engine as unknown as LearningEngine, [pending()]);
-    expect(engine.acknowledge).toHaveBeenCalledWith(1, 'delivery-one');
+    expect(engine.acknowledge).toHaveBeenCalledWith(1, 'delivery-one', expect.any(String));
     expect(engine.release).not.toHaveBeenCalled();
   });
 
@@ -58,7 +58,7 @@ describe('Telegram delivery reliability', () => {
     bot.api.sendMessage.mockRejectedValue(new Error('secret-bearing-network-error'));
     await expect(deliverPending(bot as unknown as Bot, engine as unknown as LearningEngine, [pending()]))
       .rejects.toThrow('Pending messages remain available for retry');
-    expect(engine.release).toHaveBeenCalledWith(1, 'delivery-one');
+    expect(engine.release).toHaveBeenCalledWith(1, 'delivery-one', expect.any(String));
     expect(engine.acknowledge).not.toHaveBeenCalled();
   });
 
@@ -67,7 +67,7 @@ describe('Telegram delivery reliability', () => {
     const bot = makeBot();
     bot.api.editMessageText.mockRejectedValue(apiError(400, 'Bad Request: message is not modified'));
     await deliverPending(bot as unknown as Bot, engine as unknown as LearningEngine, [pending()], callbackContext);
-    expect(engine.acknowledge).toHaveBeenCalledWith(1, 'delivery-one');
+    expect(engine.acknowledge).toHaveBeenCalledWith(1, 'delivery-one', expect.any(String));
     expect(bot.api.sendMessage).not.toHaveBeenCalled();
   });
 
@@ -77,7 +77,7 @@ describe('Telegram delivery reliability', () => {
     bot.api.editMessageText.mockRejectedValue(apiError(400, 'Bad Request: message to edit not found'));
     await deliverPending(bot as unknown as Bot, engine as unknown as LearningEngine, [pending()], callbackContext);
     expect(bot.api.sendMessage).toHaveBeenCalledOnce();
-    expect(engine.acknowledge).toHaveBeenCalledWith(1, 'delivery-one');
+    expect(engine.acknowledge).toHaveBeenCalledWith(1, 'delivery-one', expect.any(String));
   });
 
   it('suppresses notifications after a user blocks the bot', async () => {
@@ -86,7 +86,7 @@ describe('Telegram delivery reliability', () => {
     bot.api.sendMessage.mockRejectedValue(apiError(403, 'Forbidden: bot was blocked by the user'));
     await deliverPending(bot as unknown as Bot, engine as unknown as LearningEngine, [pending()]);
     expect(engine.suppressNotifications).toHaveBeenCalledWith(1);
-    expect(engine.acknowledge).toHaveBeenCalledWith(1, 'delivery-one');
+    expect(engine.acknowledge).toHaveBeenCalledWith(1, 'delivery-one', expect.any(String));
     expect(engine.release).not.toHaveBeenCalled();
   });
 
@@ -96,8 +96,8 @@ describe('Telegram delivery reliability', () => {
     bot.api.sendMessage.mockRejectedValueOnce(new Error('network failure'));
     await expect(deliverPending(bot as unknown as Bot, engine as unknown as LearningEngine, [pending(), pending('delivery-two', 2)]))
       .rejects.toThrow();
-    expect(engine.acknowledge).toHaveBeenCalledWith(2, 'delivery-two');
-    expect(engine.release).toHaveBeenCalledWith(1, 'delivery-one');
+    expect(engine.acknowledge).toHaveBeenCalledWith(2, 'delivery-two', expect.any(String));
+    expect(engine.release).toHaveBeenCalledWith(1, 'delivery-one', expect.any(String));
   });
 
   it('never removes a live webhook to start local polling', async () => {
@@ -144,7 +144,7 @@ describe('Telegram input boundaries', () => {
       update_id: 11,
       message: { message_id: 2, date: 1, chat: { id: 1, type: 'private', first_name: 'Test' }, from: { id: 1, is_bot: false, first_name: 'Test' }, text: '/start' },
     });
-    expect(engine.handle).toHaveBeenCalledWith({ userId: 1, chatId: 1, eventId: '11', text: '/start' });
+    expect(engine.handle).toHaveBeenCalledWith({ userId: 1, chatId: 1, eventId: '11', text: '/start' }, true);
   });
 
   it('acknowledges callback buttons and passes the action to the engine', async () => {
@@ -157,6 +157,6 @@ describe('Telegram input boundaries', () => {
       },
     });
     expect(methods).toEqual(['answerCallbackQuery']);
-    expect(engine.handle).toHaveBeenCalledWith({ userId: 1, chatId: 1, eventId: '12', action: 'menu:today' });
+    expect(engine.handle).toHaveBeenCalledWith({ userId: 1, chatId: 1, eventId: '12', action: 'menu:today' }, true);
   });
 });
