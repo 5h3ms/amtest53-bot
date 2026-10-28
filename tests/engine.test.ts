@@ -37,8 +37,9 @@ function harness(course = loadCourse(), accessMode: 'private' | 'public' = 'priv
     const current = await session(userId);
     const step = current.steps[current.index]!;
     const correctIndex = step.kind === 'word' ? step.correctIndex : step.question.correctIndex;
+    const count = step.kind === 'word' ? step.choices.length : step.question.options.length;
     return send({ userId, chatId: userId, now,
-      action: `answer:${current.id}:${current.index}:${correct ? correctIndex : (correctIndex + 1) % 3}` });
+      action: `answer:${current.id}:${current.index}:${correct ? correctIndex : (correctIndex + 1) % count}` });
   };
   const next = async (now = NOW) => {
     const current = await session();
@@ -196,6 +197,7 @@ describe('large vocabulary navigation', () => {
       { id: 'overlap_three', hy: 'գեղեցիկ', ru: 'красиво, Хорошо' },
       { id: 'tree', hy: 'ծառ', ru: 'дерево' },
       { id: 'water', hy: 'ջուր', ru: 'вода' },
+      { id: 'house', hy: 'տուն', ru: 'дом' },
     ];
     course.lessons = [{ id: 'gloss_lesson', titleRu: 'Синонимы', introRu: 'Выберите перевод.', vocabularyIds: ['target'], questionIds: [] }];
     const h = harness(course);
@@ -203,13 +205,91 @@ describe('large vocabulary navigation', () => {
       await h.send({ action: 'lesson:gloss_lesson' });
       const step = (await h.session()).steps[0]!;
       if (step.kind !== 'word') throw new Error('Expected word');
-      expect(new Set(step.choices)).toEqual(new Set(['хорошо; ладно', 'дерево', 'вода']));
+      expect(new Set(step.choices)).toEqual(new Set(['хорошо; ладно', 'дерево', 'вода', 'дом']));
       expect(step.choices[step.correctIndex]).toBe('хорошо; ладно');
     }
   });
 });
 
 describe('study sessions', () => {
+  it.each(['lesson:l001', 'menu:practice', 'start:exam'])('shuffles question choices for %s without changing the correct answer or published bank', async action => {
+    const h = harness();
+    const published = structuredClone(h.course.questions);
+    const orders = new Map<string, Set<string>>();
+    for (let run = 0; run < 8; run++) {
+      await h.send({ action });
+      for (const step of (await h.session()).steps) {
+        if (step.kind === 'word') {
+          expect(step.choices).toHaveLength(4);
+          expect(step.choices[step.correctIndex]).toBe(step.word.ru);
+          continue;
+        }
+        const original = published.find(question => question.id === step.question.id)!;
+        expect(step.question.options).toHaveLength(4);
+        expect(step.question.options[step.question.correctIndex]).toEqual(original.options[original.correctIndex]);
+        const variants = orders.get(original.id) ?? new Set<string>();
+        variants.add(JSON.stringify(step.question.options));
+        orders.set(original.id, variants);
+      }
+    }
+    expect([...orders.values()].some(variants => variants.size > 1)).toBe(true);
+    expect(h.course.questions).toEqual(published);
+  });
+
+  it.each(['word', 'question'] as const)('accepts the fourth %s choice and awards the correct result', async kind => {
+    const h = harness();
+    await h.send({ action: kind === 'word' ? 'menu:words' : 'menu:practice' });
+    await h.store.update('u_1', raw => {
+      const user = raw as UserState, step = user.session!.steps[0]!;
+      if (step.kind === 'word') {
+        const correct = step.choices.splice(step.correctIndex, 1)[0]!;
+        step.choices.push(correct); step.correctIndex = 3;
+      } else {
+        const correct = step.question.options.splice(step.question.correctIndex, 1)[0]!;
+        step.question.options.push(correct); step.question.correctIndex = 3;
+      }
+      return { state: user, result: undefined };
+    });
+    const current = await h.session();
+    const resumed = await h.send({ action: 'menu:continue' });
+    expect(resumed?.buttons?.[0]?.map(button => button.text)).toEqual(['1', '2', '3', '4']);
+    await h.send({ action: `answer:${current.id}:0:3` });
+    expect((await h.session()).answers[0]).toMatchObject({ selected: 3, correct: true });
+    expect((await h.state())?.correct).toBe(1);
+  });
+
+  it.each(['word', 'question'] as const)('continues a saved three-choice %s snapshot after the four-choice upgrade', async kind => {
+    const h = harness();
+    await h.send({ action: kind === 'word' ? 'menu:words' : 'menu:practice' });
+    await h.store.update('u_1', raw => {
+      const user = raw as UserState, step = user.session!.steps[0]!;
+      user.session!.contentVersion = 'legacy-three-choices';
+      if (step.kind === 'word') {
+        const correct = step.choices[step.correctIndex]!;
+        step.choices = [...step.choices.filter((_, index) => index !== step.correctIndex).slice(0, 2), correct];
+        step.correctIndex = 2;
+      } else {
+        const correct = step.question.options[step.question.correctIndex]!;
+        step.question.options = [...step.question.options.filter((_, index) => index !== step.question.correctIndex).slice(0, 2), correct];
+        step.question.correctIndex = 2;
+      }
+      return { state: user, result: undefined };
+    });
+    const original = await h.session();
+    h.course.version = 'future-four-choices';
+    h.course.questions.forEach(question => { question.promptHy = 'changed after session creation'; });
+    h.course.vocabulary.forEach(word => { word.ru = `changed ${word.id}`; });
+    h.restart();
+    const view = await h.send({ action: 'menu:continue' });
+    expect(view?.buttons?.[0]?.map(button => button.text)).toEqual(['1', '2', '3']);
+    expect(await h.session()).toEqual(original);
+    await h.send({ action: `answer:${original.id}:0:3` });
+    expect((await h.state())?.attempts).toBe(0);
+    await h.send({ action: `answer:${original.id}:0:2` });
+    expect((await h.session()).answers[0]).toMatchObject({ selected: 2, correct: true });
+    expect((await h.state())?.correct).toBe(1);
+  });
+
   it('shows translation without advancing or awarding progress, then records the hinted answer', async () => {
     const h = harness();
     await h.send({ action: 'menu:practice' });
@@ -263,7 +343,7 @@ describe('study sessions', () => {
     await h.send({ action: 'menu:practice' });
     const session = await h.session();
     await h.next();
-    for (const selected of ['-1', '3', 'NaN', '1.5']) {
+    for (const selected of ['-1', '4', 'NaN', '1.5']) {
       await h.send({ action: `answer:${session.id}:0:${selected}` });
     }
     expect((await h.session()).index).toBe(0);

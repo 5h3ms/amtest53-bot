@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { Course, Question, Vocabulary } from './course.js';
 import type { StateStore } from './storage.js';
+import { selectWordDistractors } from './vocabulary-choices.js';
 
 export interface MessageView { text: string; buttons?: Array<Array<{ text: string; data: string }>> }
 export interface PendingDelivery { id: string; userId: number; chatId: number; view: MessageView }
@@ -241,7 +242,7 @@ export class LearningEngine {
       if (name === 'settings') return this.settings(user);
       if (name === 'help') return { text: `Курс помогает понимать армянские вопросы и повторять нужные слова. В тренировке доступны подсказки; в пробном тесте их нет.\n\n${this.course.noticeRu}\n\n/start — меню\n/progress — прогресс\n/remind 19:00 Asia/Yerevan — напоминания\n/privacy — данные\n/reset — сброс\n\nТест в учебном боте не заменяет официальную процедуру.`, buttons: [menuButton] };
       if (name === 'continue' && user.session) return this.renderSession(user);
-      if (name === 'exam') return { text: 'Пробный тест: 33 вопроса на армянском, 60 минут, проходной результат 17. Перевод и подсказки выключены.\n\nЭто авторские тренировочные вопросы, а не подтверждённый текущий официальный банк. Начало теста заменит незавершённое занятие.', buttons: [[button('Начать тест', 'start:exam')], menuButton] };
+      if (name === 'exam') return { text: 'Пробный тест: 33 вопроса на армянском, по 4 варианта ответа, 60 минут, проходной результат 17. Перевод и подсказки выключены.\n\nЭто авторские тренировочные вопросы, а не подтверждённый текущий официальный банк. Начало теста заменит незавершённое занятие.', buttons: [[button('Начать тест', 'start:exam')], menuButton] };
       if (name === 'lessons' || name.startsWith('lessons:')) return this.lessons(user, name.slice('lessons:'.length));
       if (name === 'today' && user.session && user.session.endedAt === null) return this.renderSession(user);
       if (name === 'today') return this.startToday(user, event.eventId, now);
@@ -276,7 +277,9 @@ export class LearningEngine {
         return this.renderSession(user);
       }
       const selected = Number(parts[3]);
-      if (!Number.isInteger(selected) || selected < 0 || selected > 2 || session.feedback) return this.renderSession(user);
+      const step = session.steps[session.index]!;
+      const optionCount = step.kind === 'word' ? step.choices.length : step.question.options.length;
+      if (!Number.isInteger(selected) || selected < 0 || selected >= optionCount || session.feedback) return this.renderSession(user);
       this.answer(user, selected, now);
       return this.renderSession(user);
     }
@@ -323,22 +326,8 @@ export class LearningEngine {
     return this.settings(user);
   }
   private wordStep(word: Vocabulary, seed: string): Step {
-    const normalizeHy = (text: string) => text.normalize('NFC').trim().toLocaleLowerCase('hy-AM');
-    const normalizeRu = (text: string) => text.normalize('NFC').trim().toLocaleLowerCase('ru-RU').replace(/\s+/g, ' ');
-    const glosses = (text: string) => text.split(/[,;/]/).map(normalizeRu).filter(Boolean);
-    const usedGlosses = new Set(glosses(word.ru));
-    const usedTranslations = new Set([normalizeRu(word.ru)]);
-    const distractors = shuffled(this.course.vocabulary.filter(x => x.id !== word.id && normalizeHy(x.hy) !== normalizeHy(word.hy)), seed);
-    const unique: string[] = [];
-    for (const distractor of distractors) {
-      const normalized = normalizeRu(distractor.ru), meanings = glosses(distractor.ru);
-      if (!meanings.length || usedTranslations.has(normalized) || meanings.some(meaning => usedGlosses.has(meaning))) continue;
-      unique.push(distractor.ru); usedTranslations.add(normalized);
-      for (const meaning of meanings) usedGlosses.add(meaning);
-      if (unique.length === 2) break;
-    }
-    if (unique.length < 2) throw new Error('At least three different vocabulary translations are required');
-    const choices = shuffled([word.ru, ...unique], seed + word.id);
+    const distractors = selectWordDistractors(word, this.course, shuffled(this.course.vocabulary, seed + word.id));
+    const choices = shuffled([word.ru, ...distractors], seed + word.id);
     return { kind: 'word', word, choices, correctIndex: choices.indexOf(word.ru) };
   }
   private startToday(user: UserState, seed: string, now: number): MessageView {
@@ -373,8 +362,16 @@ export class LearningEngine {
     return this.begin(user, 'practice', 'Тренировка вопросов', questions.map(question => ({ kind: 'question', question })), now, seed);
   }
   private begin(user: UserState, kind: StudySession['kind'], title: string, steps: Step[], now: number, seed: string, lessonId: string | null = null): MessageView {
+    const snapshot = structuredClone(steps);
+    for (const step of snapshot) {
+      if (step.kind !== 'question') continue;
+      const question = step.question;
+      const correct = question.options[question.correctIndex]!;
+      question.options = shuffled(question.options, `${user.userId}:${seed}:${now}:${question.id}`);
+      question.correctIndex = question.options.indexOf(correct);
+    }
     user.session = { id: createHash('sha256').update(`${user.userId}:${seed}:${now}`).digest('hex').slice(0, 12), kind, title, lessonId,
-      contentVersion: this.course.version, steps: structuredClone(steps), index: 0, answers: [], hints: [], feedback: false,
+      contentVersion: this.course.version, steps: snapshot, index: 0, answers: [], hints: [], feedback: false,
       startedAt: now, deadlineAt: kind === 'exam' ? now + 3600_000 : null, endedAt: null };
     return this.renderSession(user);
   }
@@ -437,7 +434,7 @@ export class LearningEngine {
       text += step.kind === 'word' ? `${step.word.hy} — ${step.word.ru}${step.word.exampleHy ? `\n${step.word.exampleHy}\n${step.word.exampleRu ?? ''}` : ''}` : `${step.question.explanationRu}\nИсточник: ${step.question.source.article}\n${step.question.source.url}`;
       return { text, buttons: [[button('Дальше', `next:${session.id}:${session.index}`)], menuButton] };
     }
-    const rows = [[0, 1, 2].map(i => button(String(i + 1), `answer:${session.id}:${session.index}:${i}`))];
+    const rows = [options.map((_, i) => button(String(i + 1), `answer:${session.id}:${session.index}:${i}`))];
     if (session.kind !== 'exam' && !isHinted) rows.push([button(step.kind === 'word' ? 'Показать перевод' : 'Перевод вопроса', `hint:${session.id}:${session.index}`)]);
     rows.push(menuButton);
     return { text, buttons: rows };
