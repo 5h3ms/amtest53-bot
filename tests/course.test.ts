@@ -15,6 +15,7 @@ describe('published starter course', () => {
       expect(question.source.article).toMatch(/\d/);
       expect(question.source.checkedOn).toBe(course.checkedOn);
       expect(question.options[question.correctIndex]).toBeDefined();
+      expect(question.options).toHaveLength(4);
       expect(question.promptHy).toMatch(/[\u0530-\u058f]/);
       expect(question.promptRu).toMatch(/[А-Яа-яЁё]/);
     }
@@ -48,11 +49,17 @@ describe('published starter course', () => {
     repeated.questions[0]!.options[1]!.hy = repeated.questions[0]!.options[0]!.hy;
     expect(() => validateCourse(repeated)).toThrow(/Repeated options/);
     const invalidIndex = loadCourse();
-    invalidIndex.questions[0]!.correctIndex = 3;
+    invalidIndex.questions[0]!.correctIndex = 4;
     expect(() => validateCourse(invalidIndex)).toThrow();
     const invalidCount = loadCourse();
     invalidCount.questions[0]!.options.pop();
     expect(() => validateCourse(invalidCount)).toThrow();
+    const fourth = loadCourse();
+    fourth.questions[0]!.correctIndex = 3;
+    expect(validateCourse(fourth).questions[0]!.correctIndex).toBe(3);
+    const repeatedTranslation = loadCourse();
+    repeatedTranslation.questions[0]!.options[3]!.ru = `  ${repeatedTranslation.questions[0]!.options[0]!.ru.toUpperCase()}  `;
+    expect(() => validateCourse(repeatedTranslation)).toThrow(/Repeated options/);
   });
 
   it('rejects unknown question/vocabulary references and duplicate lesson references', () => {
@@ -82,9 +89,9 @@ describe('published starter course', () => {
     expect(() => validateCourse(blank)).toThrow();
   });
 
-  it('rejects vocabulary that cannot produce three distinct translation choices', () => {
+  it('rejects vocabulary that cannot produce four distinct translation choices', () => {
     const course = loadCourse();
-    course.vocabulary.forEach((word, index) => { word.ru = index % 2 === 0 ? 'значение один' : 'значение два'; });
+    course.vocabulary.forEach((word, index) => { word.ru = ['значение один', 'значение два', 'значение три'][index % 3]!; });
     expect(() => validateCourse(course)).toThrow();
   });
 });

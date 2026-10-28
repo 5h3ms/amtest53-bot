@@ -8,7 +8,7 @@ function baseCourse(): Course {
     version: 'authored.v1', title: 'Учебный курс', noticeRu: 'Учебные материалы', checkedOn: '2026-10-28',
     questions: [{
       id: 'q001', topic: 'Государство', promptHy: 'Հայաստան', promptRu: 'Армения',
-      options: [{ hy: 'Հայաստան', ru: 'Армения' }, { hy: 'պետություն', ru: 'государство' }, { hy: 'քաղաքացի', ru: 'гражданин' }],
+      options: [{ hy: 'Հայաստան', ru: 'Армения' }, { hy: 'պետություն', ru: 'государство' }, { hy: 'քաղաքացի', ru: 'гражданин' }, { hy: 'ժողովուրդ', ru: 'народ' }],
       correctIndex: 0, explanationRu: 'Объяснение',
       source: { url: 'https://example.org/constitution', article: '1', checkedOn: '2026-10-28' },
       vocabularyIds: ['v001'],
@@ -17,10 +17,11 @@ function baseCourse(): Course {
       { id: 'v001', hy: 'Հայաստան', ru: 'Армения', exampleHy: 'Հայաստան', exampleRu: 'Армения' },
       { id: 'v002', hy: 'պետություն', ru: 'государство' },
       { id: 'v003', hy: 'քաղաքացի', ru: 'гражданин' },
+      { id: 'v004', hy: 'ժողովուրդ', ru: 'народ' },
     ],
     lessons: Array.from({ length: 10 }, (_, index) => ({
       id: `l${String(index + 1).padStart(3, '0')}`, titleRu: `Урок ${index + 1}`, introRu: 'Инструкция',
-      vocabularyIds: ['v001', 'v002', 'v003'], questionIds: ['q001'],
+      vocabularyIds: ['v001', 'v002', 'v003', 'v004'], questionIds: ['q001'],
     })),
   });
 }
@@ -39,7 +40,7 @@ describe('vocabulary importer', () => {
       record(),
     ];
     const { course, stats } = importVocabulary(original, records);
-    expect(course.vocabulary).toHaveLength(4);
+    expect(course.vocabulary).toHaveLength(5);
     expect(course.vocabulary.find(word => word.id === 'v002')).toEqual({
       id: 'v002', hy: 'պետություն', ru: 'государство; странА; держава', category: 'nouns',
       sources: [{ workbook: 'nouns', sheet: 'Слова', row: 2 }, { workbook: 'nouns', sheet: 'Слова', row: 3 }],
@@ -49,7 +50,7 @@ describe('vocabulary importer', () => {
     expect(course.lessons.slice(0, 10)).toEqual(original.lessons);
     expect(course.vocabulary[0]).toEqual(original.vocabulary[0]);
     expect(stats).toEqual({ inputRecords: 4, importedHeadwords: 2, addedVocabulary: 1,
-      updatedVocabulary: 1, generatedLessons: 1, totalVocabulary: 4 });
+      updatedVocabulary: 1, generatedLessons: 1, totalVocabulary: 5 });
   });
 
   it('normalizes whitespace and NFC for matching, and derives IDs from normalized Armenian text', () => {

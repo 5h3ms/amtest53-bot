@@ -5,8 +5,8 @@ const id = z.string().regex(/^[a-z][a-z0-9_-]{1,39}$/);
 const shortText = z.string().trim().min(1).max(1000);
 const questionSchema = z.object({
   id, topic: shortText, promptHy: shortText, promptRu: shortText,
-  options: z.array(z.object({ hy: shortText, ru: shortText })).length(3),
-  correctIndex: z.number().int().min(0).max(2),
+  options: z.array(z.object({ hy: shortText, ru: shortText })).length(4),
+  correctIndex: z.number().int().min(0).max(3),
   explanationRu: shortText,
   source: z.object({ url: z.url().startsWith('https://'), article: shortText, checkedOn: z.iso.date() }),
   vocabularyIds: z.array(id),
@@ -21,7 +21,7 @@ const vocabularySchema = z.object({
 const courseSchema = z.object({
   version: shortText, title: shortText, noticeRu: shortText, checkedOn: z.iso.date(),
   questions: z.array(questionSchema).min(1),
-  vocabulary: z.array(vocabularySchema).min(3),
+  vocabulary: z.array(vocabularySchema).min(4),
   lessons: z.array(z.object({ id, titleRu: shortText, introRu: shortText,
     vocabularyIds: z.array(id).min(1), questionIds: z.array(id) })).min(1),
 });
@@ -36,11 +36,14 @@ export function validateCourse(input: unknown): Course {
   }
   const words = new Set(course.vocabulary.map(x => x.id));
   const questions = new Set(course.questions.map(x => x.id));
-  if (new Set(course.vocabulary.map(x => x.ru.toLocaleLowerCase('ru-RU'))).size < 3) {
-    throw new Error('At least three distinct vocabulary translations are required');
+  if (new Set(course.vocabulary.map(x => x.ru.toLocaleLowerCase('ru-RU'))).size < 4) {
+    throw new Error('At least four distinct vocabulary translations are required');
   }
   for (const question of course.questions) {
-    if (new Set(question.options.map(x => x.hy)).size !== 3) throw new Error(`Repeated options in ${question.id}`);
+    for (const language of ['hy', 'ru'] as const) {
+      const options = question.options.map(x => x[language].normalize('NFC').trim().toLocaleLowerCase(language).replace(/\s+/g, ' '));
+      if (new Set(options).size !== 4) throw new Error(`Repeated options in ${question.id}`);
+    }
     if (question.vocabularyIds.some(x => !words.has(x))) throw new Error(`Unknown vocabulary in ${question.id}`);
   }
   for (const lesson of course.lessons) {
