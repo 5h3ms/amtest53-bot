@@ -34,6 +34,7 @@ function createRuntime() {
     accessMode: config.accessMode,
     allowedUserIds: config.allowedUserIds,
     adminUserIds: config.adminUserIds,
+    requireMaintenanceIndexReady: true,
   });
   return { engine, bot: createTelegramBot(config.token, engine) };
 }

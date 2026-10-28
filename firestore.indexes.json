@@ -1,1 +1,10 @@
-{ "indexes": [], "fieldOverrides": [{"collectionGroup":"botState","fieldPath":"stateJson","indexes":[]}] }
+{
+  "indexes": [],
+  "fieldOverrides": [
+    { "collectionGroup": "botState", "fieldPath": "stateJson", "indexes": [] },
+    { "collectionGroup": "botState", "fieldPath": "maintenanceIndexVersion", "indexes": [] },
+    { "collectionGroup": "botState", "fieldPath": "nextMaintenanceAt", "indexes": [
+      { "order": "ASCENDING", "queryScope": "COLLECTION" }
+    ] }
+  ]
+}

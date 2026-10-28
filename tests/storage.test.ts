@@ -167,32 +167,51 @@ describe("file persistence", () => {
 // Transaction conflicts and SDK serialization are covered by the emulator suite.
 function firestoreHarness() {
   type Document = Record<string, unknown>;
-  type Reference = { id: string };
+  type Reference = { id: string; get(): Promise<{ exists: boolean; data(): Document | undefined }>; delete(): Promise<void> };
   const documents = new Map<string, Document>();
+  const counts = { reads: 0, writes: 0, queries: 0, queryReads: 0, deletes: 0 };
+  const compare = (a: unknown, b: unknown) => a === b ? 0 : (a as number | string) < (b as number | string) ? -1 : 1;
   const db = {
     collection(name: string) {
       expect(name).toBe("botState");
-      const bounds: Array<{ operator: string; value: string }> = [];
+      const bounds: Array<{ field: string; operator: string; value: unknown }> = [];
+      const orders: Array<{ field: string; direction: string }> = [];
       let maximum = Infinity;
-      let afterKey: string | undefined;
+      let after: unknown[] | undefined;
+      const fieldValue = (id: string, data: Document, field: string) => field === '__name__' ? id : data[field];
+      const tupleCompare = (left: unknown[], right: unknown[]) => {
+        for (const [index, order] of orders.entries()) {
+          const comparison = compare(left[index], right[index]);
+          if (comparison) return comparison * (order.direction === 'desc' ? -1 : 1);
+        }
+        return 0;
+      };
       const query = {
-        doc: (id: string): Reference => ({ id }),
-        where(_field: unknown, operator: string, value: string) {
-          bounds.push({ operator, value });
+        doc: (id: string): Reference => ({ id,
+          async get() { counts.reads++; return { exists: documents.has(id), data: () => structuredClone(documents.get(id)) }; },
+          async delete() { counts.deletes++; documents.delete(id); },
+        }),
+        where(field: unknown, operator: string, value: unknown) {
+          bounds.push({ field: typeof field === 'string' ? field : '__name__', operator, value });
           return query;
         },
-        orderBy() { return query; },
-        startAfter(value: string) { afterKey = value; return query; },
+        orderBy(field: unknown, direction = 'asc') { orders.push({ field: typeof field === 'string' ? field : '__name__', direction }); return query; },
+        startAfter(...values: unknown[]) { after = values; return query; },
         limit(value: number) { maximum = value; return query; },
         async get() {
-          return {
-            docs: [...documents.entries()]
-              .filter(([id]) => afterKey === undefined || id > afterKey)
-              .filter(([id]) => bounds.every(({ operator, value }) => operator === ">=" ? id >= value : id <= value))
-              .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+          counts.queries++;
+          const docs = [...documents.entries()]
+              .filter(([id, data]) => bounds.every(({ field, operator, value }) => {
+                const found = fieldValue(id, data, field);
+                if (typeof found !== typeof value || found === null) return false;
+                return operator === ">=" ? compare(found, value) >= 0 : compare(found, value) <= 0;
+              }))
+              .filter(([id, data]) => after === undefined || tupleCompare(orders.map(order => fieldValue(id, data, order.field)), after) > 0)
+              .sort(([left, a], [right, b]) => tupleCompare(orders.map(order => fieldValue(left, a, order.field)), orders.map(order => fieldValue(right, b, order.field))))
               .slice(0, maximum)
-              .map(([id, data]) => ({ id, data: () => structuredClone(data) })),
-          };
+              .map(([id, data]) => ({ id, data: () => structuredClone(data) }));
+          counts.queryReads += docs.length;
+          return { docs };
         },
       };
       return query;
@@ -204,15 +223,16 @@ function firestoreHarness() {
       const writes = new Map<string, Document>();
       const result = await operation({
         async get(reference) {
+          counts.reads++;
           return { exists: documents.has(reference.id), data: () => structuredClone(documents.get(reference.id)) };
         },
         set(reference, data) { writes.set(reference.id, structuredClone(data)); },
       });
-      for (const [key, data] of writes) documents.set(key, data);
+      for (const [key, data] of writes) { documents.set(key, data); counts.writes++; }
       return result;
     },
   };
-  return { documents, store: new FirestoreStateStore(db as unknown as Firestore) };
+  return { documents, counts, store: new FirestoreStateStore(db as unknown as Firestore) };
 }
 
 const paginationFactories: Array<{ name: string; create: (records: StateRecord[]) => Promise<StateStore> }> = [
@@ -237,6 +257,57 @@ const paginationFactories: Array<{ name: string; create: (records: StateRecord[]
 ];
 
 describe.each(paginationFactories)("$name cursor pagination", ({ create }) => {
+  it('atomically rejects stale owners before calling the updater or modifying its target', async () => {
+    const store = await create([{ key: 'cache_manifest', state: { owner: 'new' } }, { key: 'cache_chunk', state: { value: 'published' } }]);
+    let called = false;
+    await expect(store.update('cache_chunk', current => {
+      called = true;
+      (current as { value: string }).value = 'stale overwrite';
+      return { state: current, result: null };
+    }, { key: 'cache_manifest', check: raw => (raw as { owner: string } | null)?.owner === 'old' })).rejects.toThrow('State update guard rejected');
+    expect(called).toBe(false);
+    expect(await store.read('cache_chunk')).toEqual({ value: 'published' });
+    await expect(store.update('cache_new', () => ({ state: {}, result: null }),
+      { key: 'missing_manifest', check: raw => raw !== null })).rejects.toThrow('State update guard rejected');
+    expect(await store.read('cache_new')).toBeNull();
+  });
+
+  it('commits matching guarded writes and isolates guard mutations from persisted state', async () => {
+    const store = await create([{ key: 'cache_manifest', state: { owner: 'current' } }]);
+    const result = await store.update('cache_chunk', () => ({ state: { value: 'new snapshot' }, result: 42 }), {
+      key: 'cache_manifest', check: raw => { const state = raw as { owner: string }; const matches = state.owner === 'current'; state.owner = 'mutated'; return matches; },
+    });
+    expect(result).toBe(42);
+    expect(await store.read('cache_chunk')).toEqual({ value: 'new snapshot' });
+    expect(await store.read('cache_manifest')).toEqual({ owner: 'current' });
+    await expect(store.update('cache_chunk', () => { throw new Error('failure'); },
+      { key: 'cache_manifest', check: () => true })).rejects.toThrow('failure');
+    expect(await store.read('cache_chunk')).toEqual({ value: 'new snapshot' });
+  });
+  it('reads isolated records and deletes only the exact requested key', async () => {
+    const store = await create([{ key: 'u_1', state: { value: [1] } }, { key: 'u_10', state: { value: [10] } }]);
+    expect(await store.read('missing')).toBeNull();
+    const value = await store.read('u_1') as { value: number[] };
+    value.value.push(2);
+    expect(await store.read('u_1')).toEqual({ value: [1] });
+    await store.delete('u_1');
+    await store.delete('missing');
+    expect(await store.read('u_1')).toBeNull();
+    expect(await store.read('u_10')).toEqual({ value: [10] });
+    await expect(store.read('../')).rejects.toThrow('State key');
+    await expect(store.delete('../')).rejects.toThrow('State key');
+  });
+
+  it('pages backwards with ascending results and exclusive cursors', async () => {
+    const store = await create(['u_1', 'u_2', 'u_3', 'u_4', 'meta_1'].map(key => ({ key, state: {} })));
+    const page = await store.listPage('u_', { beforeKey: 'u_4', limit: 2 });
+    expect(page.records.map(x => x.key)).toEqual(['u_2', 'u_3']);
+    expect(page.nextCursor).toBe('u_2');
+    const first = await store.listPage('u_', { beforeKey: page.nextCursor!, limit: 2 });
+    expect(first.records.map(x => x.key)).toEqual(['u_1']);
+    expect(first.nextCursor).toBeNull();
+    await expect(store.listPage('u_', { afterKey: 'u_1', beforeKey: 'u_4' })).rejects.toThrow('mutually exclusive');
+  });
   it("uses exclusive lexical cursors, isolates prefixes and detects a full final page", async () => {
     const store = await create(["u_a", "u_2", "u_10", "u_1", "meta_1"]
       .map(key => ({ key, state: { values: [key] } })));
@@ -287,6 +358,74 @@ describe.each(paginationFactories)("$name cursor pagination", ({ create }) => {
     }
     await expect(store.listPage("../")).rejects.toThrow("State prefix");
     await expect(store.listPage("u_", null as never)).rejects.toThrow("State page options");
+  });
+});
+
+const indexedUser = (userId: number, deadlineAt: number | null = null) => ({
+  schema: 1, userId, chatId: userId, blocked: false, outbox: [],
+  reminders: { enabled: false, time: '19:00', timeZone: 'Asia/Yerevan', lastSentDate: null },
+  session: deadlineAt === null ? null : { kind: 'exam', deadlineAt, endedAt: null },
+});
+
+describe('Firestore operation savings and maintenance metadata', () => {
+  it('skips unchanged writes and absent-null writes but still returns updater results', async () => {
+    const { store, counts, documents } = firestoreHarness();
+    expect(await store.update('empty', () => ({ state: null, result: 7 }))).toBe(7);
+    expect(documents.has('empty')).toBe(false);
+    expect(counts.writes).toBe(0);
+    await store.update('cache_stats', () => ({ state: { count: 1 }, result: null }));
+    await store.update('cache_stats', current => ({ state: current, result: null }));
+    expect(counts).toMatchObject({ reads: 3, writes: 1 });
+    expect(documents.get('cache_stats')).not.toHaveProperty('nextMaintenanceAt');
+  });
+
+  it('writes due metadata atomically, clears finished work, and repairs legacy envelopes once', async () => {
+    const { store, counts, documents } = firestoreHarness();
+    const deadline = Date.now() + 60_000;
+    const state = indexedUser(1, deadline);
+    documents.set('u_1', { key: 'u_1', version: 1, stateJson: JSON.stringify(state) });
+    await store.update('u_1', current => ({ state: current, result: null }));
+    expect(documents.get('u_1')).toMatchObject({ maintenanceIndexVersion: 1, nextMaintenanceAt: deadline });
+    await store.update('u_1', current => ({ state: current, result: null }));
+    expect(counts.writes).toBe(1);
+    await store.update('u_1', () => ({ state: indexedUser(1), result: null }));
+    expect(documents.get('u_1')).toMatchObject({ maintenanceIndexVersion: 1, nextMaintenanceAt: null });
+    expect(JSON.parse(documents.get('u_1')!.stateJson as string)).toEqual(indexedUser(1));
+  });
+
+  it('queries only due users, with stable tied-time cursors, without reading idle users', async () => {
+    const { store, documents, counts } = firestoreHarness();
+    const now = Date.now();
+    for (let id = 1; id <= 1000; id++) {
+      const state = indexedUser(id);
+      documents.set(`u_${id}`, { key: `u_${id}`, version: 1, stateJson: JSON.stringify(state), maintenanceIndexVersion: 1, nextMaintenanceAt: null });
+    }
+    for (const [id, at] of [[1, now - 1000], [2, now], [3, now], [4, now + 1000]] as const) {
+      await store.update(`u_${id}`, () => ({ state: indexedUser(id, at), result: null }));
+    }
+    const first = await store.listDuePage(now, { limit: 2 });
+    expect(first.records.map(x => x.key)).toEqual(['u_1', 'u_2']);
+    expect(first.nextCursor).toEqual({ at: now, key: 'u_2' });
+    await store.update('u_1', () => ({ state: indexedUser(1), result: null }));
+    const last = await store.listDuePage(now, { limit: 2, after: first.nextCursor! });
+    expect(last.records.map(x => x.key)).toEqual(['u_3']);
+    expect(last.nextCursor).toBeNull();
+    expect(counts.queryReads).toBe(4); // Three due documents plus one page lookahead, not 1000 users.
+    expect(counts.queries).toBe(2);
+  });
+});
+
+describe.each(factories)('$name maintenance selection', ({ create }) => {
+  it('selects due states consistently with the Firestore adapter', async () => {
+    const store = await create(), now = Date.now();
+    for (let id = 1; id <= 4; id++) await store.update(`u_${id}`, () => ({ state: indexedUser(id, id === 4 ? null : now), result: null }));
+    const page = await store.listDuePage(now, { limit: 2 });
+    expect(page.records.map(x => x.key)).toEqual(['u_1', 'u_2']);
+    expect(page.nextCursor).toEqual({ at: now, key: 'u_2' });
+    expect((await store.listDuePage(now, { after: page.nextCursor!, limit: 2 })).records.map(x => x.key)).toEqual(['u_3']);
+    await expect(store.listDuePage(NaN)).rejects.toThrow('maintenance time');
+    await expect(store.listDuePage(now, { after: { at: NaN, key: 'u_1' } })).rejects.toThrow('cursor');
+    await expect(store.listDuePage(now, { limit: 0 })).rejects.toThrow('limit');
   });
 });
 

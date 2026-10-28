@@ -1,4 +1,5 @@
 import { Bot, GrammyError, InlineKeyboard, type Context } from 'grammy';
+import { randomUUID } from 'node:crypto';
 import type { LearningEngine, PendingDelivery } from './engine.js';
 import { ConfigurationError } from './config.js';
 
@@ -44,7 +45,14 @@ export async function deliverPending(
 ): Promise<void> {
   let failed = false;
   for (const [index, delivery] of pending.entries()) {
-    if (!(await engine.claim(delivery.userId, delivery.id))) continue;
+    let token = delivery.leaseToken;
+    // A new event already owns its first delivery in the event transaction.
+    // Refresh nearly expired leases; legacy/backlogged messages claim just before sending.
+    if (!token || (delivery.leaseUntil ?? 0) < Date.now() + 25_000) {
+      const nextToken = randomUUID();
+      if (!(await engine.claim(delivery.userId, delivery.id, nextToken, token))) continue;
+      token = nextToken;
+    }
     try {
       const options = { reply_markup: keyboardFor(delivery.view) };
       const message = context?.callbackQuery?.message;
@@ -66,14 +74,14 @@ export async function deliverPending(
       } else {
         await bot.api.sendMessage(delivery.chatId, delivery.view.text, options);
       }
-      await engine.acknowledge(delivery.userId, delivery.id);
+      await engine.acknowledge(delivery.userId, delivery.id, token);
     } catch (error) {
       if (error instanceof GrammyError && error.error_code === 403) {
         // A blocked/deactivated chat cannot receive this message. Do not retry it.
         await engine.suppressNotifications(delivery.userId);
-        await engine.acknowledge(delivery.userId, delivery.id);
+        await engine.acknowledge(delivery.userId, delivery.id, token);
       } else {
-        await engine.release(delivery.userId, delivery.id);
+        await engine.release(delivery.userId, delivery.id, token);
         failed = true;
       }
     }
@@ -91,7 +99,7 @@ export function createTelegramBot(token: string, engine: LearningEngine): Bot {
       chatId: context.chat.id,
       eventId: String(context.update.update_id),
       text: context.message.text,
-    });
+    }, true);
     await deliverPending(bot, engine, pending, context);
   });
 
@@ -105,7 +113,7 @@ export function createTelegramBot(token: string, engine: LearningEngine): Bot {
       chatId: context.chat.id,
       eventId: String(context.update.update_id),
       action: context.callbackQuery.data,
-    });
+    }, true);
     await deliverPending(bot, engine, pending, context);
   });
 
