@@ -34,6 +34,12 @@ npx firebase deploy --only functions:amtest53,firestore:rules,firestore:indexes 
 
 Появятся HTTPS-функция `telegramWebhook` и расписание `maintenanceSchedule`. Для webhook необходим публичный HTTPS-вызов (Telegram не использует Google IAM); проверка секретного заголовка выполняется внутри функции до обработки. Расписание вызывается Cloud Scheduler с его штатной аутентификацией.
 
+При первой публикации CLI может подтвердить создание функций и затем завершиться с сообщением об отсутствующей политике очистки образов. Настройте её отдельно; уже созданные функции повторно публиковать для этого не нужно:
+
+```powershell
+npx firebase functions:artifacts:setpolicy --location europe-west1 --days 7 --force --project amtest53-bot --non-interactive
+```
+
 После публикации запишите фактический URL `telegramWebhook` в `.env.local` как `WEBHOOK_URL`. Не угадывайте URL по имени проекта. Убедитесь, что локальный `npm run dev` остановлен, затем:
 
 ```powershell
