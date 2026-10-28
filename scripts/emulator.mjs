@@ -1,0 +1,10 @@
+import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+const cli = new URL('../node_modules/firebase-tools/lib/bin/firebase.js', import.meta.url);
+const args = [fileURLToPath(cli), 'emulators:start', '--only', 'firestore', '--project', 'demo-amtest53-bot', '--export-on-exit', '.emulator-data'];
+if (existsSync('.emulator-data/firebase-export-metadata.json')) args.push('--import', '.emulator-data');
+const child = spawn(process.execPath, args, { stdio: 'inherit', env: { ...process.env, GCLOUD_PROJECT: 'demo-amtest53-bot' } });
+child.on('error', () => { console.error('Cannot start Firebase Emulator. Run npm ci and check Java 21.'); process.exitCode = 1; });
+child.on('exit', code => { process.exitCode = code ?? 1; });
+process.on('SIGINT', () => { child.kill('SIGINT'); });

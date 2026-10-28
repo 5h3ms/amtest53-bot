@@ -1,0 +1,15 @@
+{
+  "functions": [{
+    "source": ".",
+    "codebase": "amtest53",
+    "runtime": "nodejs22",
+    "ignore": ["node_modules", ".git", "src", "tests", "scripts", ".github", ".env*", ".secret.local", ".local", ".emulator-data", ".firebase", "private-materials", "*-debug.log*", "*.log", "coverage"],
+    "predeploy": ["npm run build"]
+  }],
+  "firestore": { "rules": "firestore.rules", "indexes": "firestore.indexes.json" },
+  "emulators": {
+    "firestore": { "host": "127.0.0.1", "port": 8080 },
+    "ui": { "enabled": true, "host": "127.0.0.1", "port": 4000 },
+    "singleProjectMode": true
+  }
+}

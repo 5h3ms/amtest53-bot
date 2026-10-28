@@ -1,0 +1,40 @@
+{
+  "name": "amtest53-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Text-only Armenian citizenship preparation Telegram bot",
+  "type": "module",
+  "main": "lib/functions.js",
+  "engines": {
+    "node": "22"
+  },
+  "scripts": {
+    "dev": "tsx src/dev.ts",
+    "identify": "tsx src/identify.ts",
+    "emulator": "node scripts/emulator.mjs",
+    "build": "tsc && node scripts/copy-content.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "npm run typecheck && npm test && npm run content:check && npm run secrets:check",
+    "content:check": "tsx scripts/check-content.ts",
+    "secrets:check": "node scripts/check-secrets.mjs",
+    "test:emulator": "firebase emulators:exec --only firestore --project demo-amtest53-bot \"vitest run tests/firestore.integration.test.ts\"",
+    "telegram:webhook": "tsx scripts/webhook.ts",
+    "content:import": "tsx scripts/import-vocabulary.ts"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "firebase-admin": "14.5.0",
+    "firebase-functions": "7.4.0",
+    "grammy": "^1.38.3",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "firebase-tools": "15.34.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "5.0.5"
+  }
+}

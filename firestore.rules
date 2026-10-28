@@ -1,0 +1,7 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // The bot uses a server identity. No direct client database access.
+    match /{document=**} { allow read, write: if false; }
+  }
+}
