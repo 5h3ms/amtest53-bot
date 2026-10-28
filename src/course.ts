@@ -8,6 +8,10 @@ const questionSchema = z.object({
   options: z.array(z.object({ hy: shortText, ru: shortText })).length(4),
   correctIndex: z.number().int().min(0).max(3),
   explanationRu: shortText,
+  readingHelp: z.array(z.object({
+    hy: z.string().trim().min(1).max(160), ru: z.string().trim().min(1).max(160),
+    noteRu: z.string().trim().min(1).max(240),
+  })).max(3).optional(),
   source: z.object({ url: z.url().startsWith('https://'), article: shortText, checkedOn: z.iso.date() }),
   vocabularyIds: z.array(id),
 });
@@ -22,12 +26,22 @@ const courseSchema = z.object({
   version: shortText, title: shortText, noticeRu: shortText, checkedOn: z.iso.date(),
   questions: z.array(questionSchema).min(1),
   vocabulary: z.array(vocabularySchema).min(4),
-  lessons: z.array(z.object({ id, titleRu: shortText, introRu: shortText,
+  lessons: z.array(z.object({ id, titleRu: shortText, introRu: shortText, examTrack: z.boolean().optional(),
     vocabularyIds: z.array(id).min(1), questionIds: z.array(id) })).min(1),
 });
 export type Course = z.infer<typeof courseSchema>;
 export type Question = Course['questions'][number];
 export type Vocabulary = Course['vocabulary'][number];
+
+export function examLessons(course: Course): Course['lessons'] {
+  return course.lessons.filter(lesson => lesson.examTrack ?? lesson.questionIds.length > 0);
+}
+
+export function examVocabulary(course: Course): Vocabulary[] {
+  const ids = new Set([...examLessons(course).flatMap(lesson => lesson.vocabularyIds),
+    ...course.questions.flatMap(question => question.vocabularyIds)]);
+  return course.vocabulary.filter(word => ids.has(word.id));
+}
 
 export function validateCourse(input: unknown): Course {
   const course = courseSchema.parse(input);

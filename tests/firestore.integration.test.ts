@@ -87,7 +87,7 @@ describe.skipIf(!safeEmulator)("Firestore state store (local demo emulator only)
     expect((await store.list(key))[0]?.state).toEqual({ score: 1 });
   });
 
-  it("persists real engine outbox button rows and reads them on the next event", async () => {
+  it("persists engine sessions, analytics and feedback without counting retried answers twice", async () => {
     const namespacedStore: StateStore = {
       update: (key, fn) => store.update(`${prefix}${key}`, fn),
       list: async filter => (await store.list(`${prefix}${filter}`))
@@ -115,7 +115,27 @@ describe.skipIf(!safeEmulator)("Firestore state store (local demo emulator only)
     expect(state.outbox).toHaveLength(1);
     expect(state.outbox[0]?.view).toEqual(deliveries[0]?.view);
     expect(JSON.parse(document.stateJson as string)).toEqual(state);
-  });
+    await engine.handle({ ...event, eventId: 'start-practice', text: undefined, action: 'menu:practice' });
+    const started = (await namespacedStore.list('u_'))[0]!.state as UserState;
+    const session = started.session!, step = session.steps[0]!;
+    if (step.kind !== 'question') throw new Error('Expected a question');
+    const answerEvent = { ...event, eventId: 'answer-with-retries', text: undefined,
+      action: `answer:${session.id}:0:${step.question.correctIndex}` };
+    await Promise.all(Array.from({ length: 3 }, () => engine.handle(answerEvent)));
+    const answered = (await namespacedStore.list('u_'))[0]!.state as UserState;
+    expect(answered.attempts).toBe(1);
+    expect(answered.questionProgress?.[step.question.id]?.seen).toBe(1);
+    expect(Object.values(answered.analytics!.days).reduce((sum, day) => sum + day.answers, 0)).toBe(1);
+    await engine.handle({ ...event, eventId: 'report-start', text: undefined, action: `report:${session.id}:0` });
+    const reporting = (await namespacedStore.list('u_'))[0]!.state as UserState;
+    const token = reporting.feedback!.pending!.token;
+    await engine.handle({ ...event, eventId: 'report-category', text: undefined, action: `feedback:${token}:category:translation` });
+    await engine.handle({ ...event, eventId: 'report-description', text: 'Проверьте перевод вопроса.' });
+    const reloaded = (await namespacedStore.list('u_'))[0]!.state as UserState;
+    expect(reloaded.feedback?.reports).toHaveLength(1);
+    expect(reloaded.feedback?.reports[0]?.target.options).toHaveLength(4);
+    expect(reloaded.questionProgress?.[step.question.id]?.level).toBe(1);
+  }, 30_000);
 
   it("rejects invalid or oversized state before committing an update", async () => {
     const key = `${prefix}invalid_payload`;
