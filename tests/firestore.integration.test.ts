@@ -33,9 +33,11 @@ describe.skipIf(!safeEmulator)("Firestore state store (local demo emulator only)
     const records = await db.collection("botState")
       .where(FieldPath.documentId(), ">=", prefix)
       .where(FieldPath.documentId(), "<=", `${prefix}\uf8ff`).get();
-    const batch = db.batch();
-    for (const record of records.docs) batch.delete(record.ref);
-    await batch.commit();
+    for (let offset = 0; offset < records.docs.length; offset += 500) {
+      const batch = db.batch();
+      for (const record of records.docs.slice(offset, offset + 500)) batch.delete(record.ref);
+      await batch.commit();
+    }
     await deleteApp(app);
   });
 
@@ -90,6 +92,13 @@ describe.skipIf(!safeEmulator)("Firestore state store (local demo emulator only)
       update: (key, fn) => store.update(`${prefix}${key}`, fn),
       list: async filter => (await store.list(`${prefix}${filter}`))
         .map(record => ({ key: record.key.slice(prefix.length), state: record.state })),
+      listPage: async (filter, options = {}) => {
+        const page = await store.listPage(`${prefix}${filter}`, {
+          ...options, afterKey: options.afterKey === undefined ? undefined : `${prefix}${options.afterKey}`,
+        });
+        return { records: page.records.map(record => ({ key: record.key.slice(prefix.length), state: record.state })),
+          nextCursor: page.nextCursor === null ? null : page.nextCursor.slice(prefix.length) };
+      },
     };
     const engine = new LearningEngine({
       store: namespacedStore, course: loadCourse(), allowedUserIds: [42], adminUserIds: [],
@@ -126,4 +135,31 @@ describe.skipIf(!safeEmulator)("Firestore state store (local demo emulator only)
     await expect(store.list(key)).rejects.toThrow("invalid JSON");
     expect((await reference.get()).data()).toEqual(original);
   });
+
+  it("pages through more than 1000 real documents without omissions or duplicates", async () => {
+    const pagePrefix = `${prefix}page_`;
+    const keys = Array.from({ length: 1005 }, (_, index) => `${pagePrefix}${String(index).padStart(4, "0")}`);
+    for (let offset = 0; offset < keys.length; offset += 500) {
+      const batch = db.batch();
+      for (const key of keys.slice(offset, offset + 500)) {
+        batch.set(db.collection("botState").doc(key), { key, version: 1, stateJson: JSON.stringify({ saved: true }) });
+      }
+      await batch.commit();
+    }
+    const first = await store.listPage(pagePrefix);
+    expect(first.records).toHaveLength(100);
+    expect(first.nextCursor).toBe(keys[99]);
+    const visited: string[] = [];
+    let afterKey: string | undefined;
+    do {
+      const page = await store.listPage(pagePrefix, { afterKey, limit: 201 });
+      visited.push(...page.records.map(record => record.key));
+      afterKey = page.nextCursor ?? undefined;
+    } while (afterKey !== undefined);
+    expect(visited).toEqual(keys);
+    expect(new Set(visited).size).toBe(1005);
+    expect((await store.list(pagePrefix)).map(record => record.key)).toEqual(keys.slice(0, 1000));
+    expect(await store.listPage(pagePrefix, { afterKey: keys.at(-1)! })).toEqual({ records: [], nextCursor: null });
+    expect((await store.listPage(pagePrefix, { afterKey: `${pagePrefix}0001a`, limit: 1 })).records[0]?.key).toBe(keys[2]);
+  }, 30_000);
 });

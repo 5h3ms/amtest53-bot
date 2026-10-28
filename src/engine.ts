@@ -65,18 +65,23 @@ export class LearningEngine {
   private readonly course: Course;
   private readonly allowed: Set<number>;
   private readonly admins: Set<number>;
-  constructor(options: { store: StateStore; course: Course; allowedUserIds: number[]; adminUserIds: number[] }) {
+  private readonly accessMode: 'private' | 'public';
+  constructor(options: { store: StateStore; course: Course; allowedUserIds: number[]; adminUserIds: number[]; accessMode?: 'private' | 'public' }) {
     this.store = options.store; this.course = options.course;
     this.allowed = new Set([...options.allowedUserIds, ...options.adminUserIds]);
     this.admins = new Set(options.adminUserIds);
+    this.accessMode = options.accessMode ?? 'private';
+  }
+  private canAccess(userId: number): boolean {
+    return Number.isSafeInteger(userId) && userId > 0 && (this.accessMode === 'public' || this.allowed.has(userId));
   }
   async handle(event: BotEvent): Promise<PendingDelivery[]> {
-    if (!Number.isSafeInteger(event.userId) || event.userId <= 0 || event.chatId !== event.userId) return [];
-    if (!this.allowed.has(event.userId)) return [];
+    if (!this.canAccess(event.userId) || event.chatId !== event.userId) return [];
     const now = event.now ?? Date.now();
     if (!Number.isFinite(now) || !event.eventId || event.eventId.length > 100) throw new Error('Invalid event');
     return this.store.update(key(event.userId), raw => {
       const user = raw === null ? initial(event.userId, event.chatId, now) : parseState(raw);
+      if (user.userId !== event.userId || user.chatId !== event.chatId) return { state: user, result: [] };
       this.pruneReminders(user, now);
       if (user.processedEvents.includes(event.eventId)) return { state: user, result: this.pending(user) };
       user.updatedAt = now; user.blocked = false;
@@ -94,14 +99,15 @@ export class LearningEngine {
     });
   }
   async claim(userId: number, id: string): Promise<boolean> {
-    if (!this.allowed.has(userId)) return false;
+    if (!this.canAccess(userId)) return false;
     return this.store.update(key(userId), raw => {
       if (raw === null) return { state: null, result: false };
       const user = parseState(raw), now = Date.now();
+      if (user.userId !== userId || user.chatId !== userId) return { state: user, result: false };
       this.pruneReminders(user, now);
       const item = user.outbox.find(x => x.id === id);
       if (user.blocked) return { state: user, result: false };
-      if (!item || item.leaseUntil > now) return { state: user, result: false };
+      if (!item || item.userId !== userId || item.chatId !== userId || item.leaseUntil > now) return { state: user, result: false };
       item.leaseUntil = now + 30_000;
       return { state: user, result: true };
     });
@@ -130,38 +136,82 @@ export class LearningEngine {
   }
   async maintenance(now = Date.now()): Promise<PendingDelivery[]> {
     const pending: PendingDelivery[] = [];
-    // Access and small-group capacity are explicit; revoked IDs receive no deliveries.
-    for (const userId of this.allowed) {
-      const items = await this.store.update(key(userId), raw => {
-        if (raw === null) return { state: null, result: [] as PendingDelivery[] };
-        const user = parseState(raw);
-        this.pruneReminders(user, now);
-        if (user.blocked) return { state: user, result: [] as PendingDelivery[] };
-        if (this.expireExam(user, now)) this.enqueue(user, `timeout_${user.session!.id}`, this.renderSession(user), now);
-        if (user.reminders.enabled) {
-          const local = dateParts(now, user.reminders.timeZone);
-          const toMinutes = (time: string) => Number(time.slice(0, 2)) * 60 + Number(time.slice(3));
-          const difference = toMinutes(local.time) - toMinutes(user.reminders.time);
-          const delay = (difference + 1440) % 1440;
-          const scheduledDate = difference < 0
-            ? new Date(Date.parse(`${local.date}T12:00:00Z`) - DAY).toISOString().slice(0, 10)
-            : local.date;
-          // A ten-minute grace window covers the five-minute scheduler; do not backfill a missed day.
-          if (delay < 10 && user.reminders.lastSentDate !== scheduledDate) {
-            user.reminders.lastSentDate = scheduledDate;
-            this.enqueue(user, `reminder_${scheduledDate}`, { text: 'Есть 15 минут на армянский? Продолжим занятие или повторим слова.',
-              buttons: [[button('Начать занятие', 'menu:today')], [button('Выключить напоминания', 'settings:off')]] }, now,
-              now + (10 - delay) * 60_000 - now % 60_000);
-          }
-        }
-        return { state: user, result: this.pending(user) };
-      });
-      pending.push(...items);
+    if (this.accessMode === 'private') {
+      // A revoked private participant receives no scheduled deliveries.
+      for (const userId of this.allowed) pending.push(...await this.maintainUser(userId, now));
+      return pending;
+    }
+    let afterKey: string | undefined;
+    while (true) {
+      const page = await this.store.listPage('u_', { afterKey, limit: 100 });
+      for (const record of page.records) {
+        const user = this.registeredUser(record.state, record.key);
+        // Read-only snapshots avoid a transaction/write for every idle registered user.
+        if (user && this.needsMaintenance(user, now)) pending.push(...await this.maintainUser(user.userId, now));
+      }
+      if (page.nextCursor === null) break;
+      if (afterKey !== undefined && page.nextCursor <= afterKey) throw new Error('Invalid maintenance page cursor');
+      afterKey = page.nextCursor;
     }
     return pending;
   }
+  private registeredUser(raw: unknown, recordKey: string): UserState | null {
+    try {
+      const user = parseState(raw);
+      if (!this.canAccess(user.userId) || key(user.userId) !== recordKey || user.chatId !== user.userId ||
+        typeof user.blocked !== 'boolean' || !Array.isArray(user.exams) || !Array.isArray(user.completedLessons) ||
+        !user.reminders || typeof user.reminders.enabled !== 'boolean' ||
+        !/^([01]\d|2[0-3]):[0-5]\d$/.test(user.reminders.time) || typeof user.reminders.timeZone !== 'string') return null;
+      if (user.reminders.enabled && !validTimeZone(user.reminders.timeZone)) return null;
+      if (user.session !== null && (!user.session || typeof user.session.id !== 'string' ||
+        !Array.isArray(user.session.steps) || !Array.isArray(user.session.answers) ||
+        user.session.answers.some(answer => !answer || typeof answer.correct !== 'boolean') ||
+        (user.session.deadlineAt !== null && !Number.isFinite(user.session.deadlineAt)))) return null;
+      if (user.outbox.some(item => !item || typeof item.id !== 'string' || item.userId !== user.userId ||
+        item.chatId !== user.userId || !item.view || typeof item.view.text !== 'string')) return null;
+      return user;
+    } catch {
+      return null;
+    }
+  }
+  private reminderSlot(user: UserState, now: number): { date: string; expiresAt: number } | null {
+    if (!user.reminders.enabled) return null;
+    const local = dateParts(now, user.reminders.timeZone);
+    const toMinutes = (time: string) => Number(time.slice(0, 2)) * 60 + Number(time.slice(3));
+    const difference = toMinutes(local.time) - toMinutes(user.reminders.time);
+    const delay = (difference + 1440) % 1440;
+    if (delay >= 10) return null;
+    const date = difference < 0
+      ? new Date(Date.parse(`${local.date}T12:00:00Z`) - DAY).toISOString().slice(0, 10)
+      : local.date;
+    if (user.reminders.lastSentDate === date) return null;
+    return { date, expiresAt: now + (10 - delay) * 60_000 - now % 60_000 };
+  }
+  private needsMaintenance(user: UserState, now: number): boolean {
+    if (user.blocked) return false;
+    const session = user.session;
+    return user.outbox.length > 0 || Boolean(session && session.kind === 'exam' && session.endedAt === null &&
+      session.deadlineAt !== null && now >= session.deadlineAt) || this.reminderSlot(user, now) !== null;
+  }
+  private async maintainUser(userId: number, now: number): Promise<PendingDelivery[]> {
+    return this.store.update(key(userId), raw => {
+      const user = this.registeredUser(raw, key(userId));
+      if (!user) return { state: raw, result: [] as PendingDelivery[] };
+      this.pruneReminders(user, now);
+      if (user.blocked) return { state: user, result: [] as PendingDelivery[] };
+      if (this.expireExam(user, now)) this.enqueue(user, `timeout_${user.session!.id}`, this.renderSession(user), now);
+      const slot = this.reminderSlot(user, now);
+      if (slot) {
+        user.reminders.lastSentDate = slot.date;
+        this.enqueue(user, `reminder_${slot.date}`, { text: 'Есть 15 минут на армянский? Продолжим занятие или повторим слова.',
+          buttons: [[button('Начать занятие', 'menu:today')], [button('Выключить напоминания', 'settings:off')]] }, now, slot.expiresAt);
+      }
+      return { state: user, result: this.pending(user) };
+    });
+  }
   private pending(user: UserState): PendingDelivery[] {
-    return user.outbox.map(({ id, userId, chatId, view }) => ({ id, userId, chatId, view }));
+    return user.outbox.filter(item => item.userId === user.userId && item.chatId === user.userId)
+      .map(({ id, userId, chatId, view }) => ({ id, userId, chatId, view }));
   }
   private pruneReminders(user: UserState, now: number): void {
     user.outbox = user.outbox.filter(item => !item.id.startsWith('reminder_') ||
@@ -177,7 +227,7 @@ export class LearningEngine {
     if (text.startsWith('/remind ')) return this.setReminder(user, text, now);
     if (text === '/privacy') return { text: 'Бот хранит ваш Telegram ID, настройки, учебный прогресс и результаты. Телефон и другие переписки не нужны. Данные не публикуются в GitHub. Для сброса прогресса используйте /reset. Доступ к данным имеет владелец бота.', buttons: [menuButton] };
     if (text === '/reset') return { text: 'Удалить ваш учебный прогресс, результаты и настройки напоминаний? Это действие нельзя отменить.', buttons: [[button('Сбросить мой прогресс', 'reset:confirm')], menuButton] };
-    if (text === '/admin' && this.admins.has(user.userId)) return { text: `Доступ разрешён ${this.allowed.size} участникам.\nВерсия курса: ${this.course.version}\nВопросов: ${this.course.questions.length}; слов: ${this.course.vocabulary.length}; уроков: ${this.course.lessons.length}.\nСписок доступа задаётся в ALLOWED_USER_IDS / ADMIN_USER_IDS.`, buttons: [menuButton] };
+    if (text === '/admin' && this.admins.has(user.userId)) return { text: `${this.accessMode === 'public' ? 'Доступ открыт всем пользователям в личном чате.' : `Доступ разрешён ${this.allowed.size} участникам.`}\nВерсия курса: ${this.course.version}\nВопросов: ${this.course.questions.length}; слов: ${this.course.vocabulary.length}; уроков: ${this.course.lessons.length}.\nРежим задаётся в ACCESS_MODE; администраторы — в ADMIN_USER_IDS.${this.accessMode === 'private' ? '\nСписок участников задаётся в ALLOWED_USER_IDS.' : ''}`, buttons: [menuButton] };
     const action = event.action ?? ({ '/start': 'menu:home', '/menu': 'menu:home', '/today': 'menu:today', '/progress': 'menu:progress', '/help': 'menu:help', '/settings': 'menu:settings' } as Record<string, string>)[text.split('@')[0] ?? ''] ?? '';
     if (action === 'reset:confirm') {
       const fresh = initial(user.userId, user.chatId, now);

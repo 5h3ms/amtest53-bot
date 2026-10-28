@@ -10,6 +10,39 @@ const testToken = `1:${'x'.repeat(24)}`;
 const valid = { BOT_TOKEN: testToken, ALLOWED_USER_IDS: '1,2', ADMIN_USER_IDS: '1' };
 
 describe('runtime configuration safety', () => {
+  it('keeps existing configurations private unless public access is explicit', () => {
+    expect(readCommonConfig(valid).accessMode).toBe('private');
+    expect(readCommonConfig({ ...valid, ACCESS_MODE: 'private' }).accessMode).toBe('private');
+    expect(() => readCommonConfig({ BOT_TOKEN: testToken, ACCESS_MODE: 'private' })).toThrow(ConfigurationError);
+  });
+
+  it('allows public access without an allowlist and keeps administrators explicit', () => {
+    const publicConfig = readCommonConfig({ BOT_TOKEN: testToken, ACCESS_MODE: 'public' });
+    expect(publicConfig.accessMode).toBe('public');
+    expect(publicConfig.allowedUserIds).toEqual([]);
+    expect(publicConfig.adminUserIds).toEqual([]);
+
+    const withAdmin = readCommonConfig({ BOT_TOKEN: testToken, ACCESS_MODE: 'public', ALLOWED_USER_IDS: '', ADMIN_USER_IDS: '3' });
+    expect(withAdmin.allowedUserIds).toEqual([]);
+    expect(withAdmin.adminUserIds).toEqual([3]);
+    expect(readLocalConfig({ BOT_TOKEN: testToken, ACCESS_MODE: 'public' }).accessMode).toBe('public');
+  });
+
+  it('does not promote an allowlist to administrators in public mode', () => {
+    const config = readCommonConfig({ ...valid, ACCESS_MODE: 'public', ALLOWED_USER_IDS: '1,2', ADMIN_USER_IDS: '3' });
+    expect(config.allowedUserIds).toEqual([1, 2]);
+    expect(config.adminUserIds).toEqual([3]);
+  });
+
+  it('fails closed for invalid modes and malformed public-mode ID lists', () => {
+    for (const mode of ['', ' ', 'PUBLIC', 'everyone', 'true']) {
+      expect(() => readCommonConfig({ ...valid, ACCESS_MODE: mode })).toThrow(ConfigurationError);
+    }
+    for (const field of ['ALLOWED_USER_IDS', 'ADMIN_USER_IDS']) {
+      expect(() => readCommonConfig({ BOT_TOKEN: testToken, ACCESS_MODE: 'public', [field]: 'all' })).toThrow(ConfigurationError);
+    }
+  });
+
   it('requires a local allowlist and rejects malformed or unsafe IDs', () => {
     expect(() => readCommonConfig({ BOT_TOKEN: testToken })).toThrow(ConfigurationError);
     for (const raw of ['1,', '-1', '0', '1x', '1.5', '9007199254740992']) {

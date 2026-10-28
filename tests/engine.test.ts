@@ -7,11 +7,11 @@ const NOW = Date.parse('2026-10-28T12:00:00Z');
 const MINUTE = 60_000;
 const DAY = 86_400_000;
 
-function harness(course = loadCourse()) {
+function harness(course = loadCourse(), accessMode: 'private' | 'public' = 'private') {
   const store = new MemoryStateStore();
   let sequence = 0;
-  const makeEngine = (allowedUserIds = [1, 2], adminUserIds: number[] = []) =>
-    new LearningEngine({ store, course, allowedUserIds, adminUserIds });
+  const makeEngine = (allowedUserIds = [1, 2], adminUserIds: number[] = [], mode = accessMode) =>
+    new LearningEngine({ store, course, allowedUserIds, adminUserIds, accessMode: mode });
   let engine = makeEngine();
   const state = async (userId = 1) => store.update(`u_${userId}`, raw => ({
     state: raw, result: structuredClone(raw) as UserState | null,
@@ -46,7 +46,7 @@ function harness(course = loadCourse()) {
   };
   return { store, course, state, session, event, send, answer, next, acknowledge,
     get engine() { return engine; },
-    restart: (allowed = [1, 2], admins: number[] = []) => { engine = makeEngine(allowed, admins); },
+    restart: (allowed = [1, 2], admins: number[] = [], mode = accessMode) => { engine = makeEngine(allowed, admins, mode); },
   };
 }
 
@@ -498,6 +498,147 @@ describe('access, isolation and delivery leases', () => {
     await h.send({ action: 'reset:confirm' });
     expect(await h.state()).toMatchObject({ attempts: 0, correct: 0, session: null, cards: {}, exams: [], reminders: { enabled: false } });
     expect(await h.state(2)).toEqual(second);
+  });
+});
+
+describe('public access', () => {
+  it('registers an unlisted private-chat user, teaches a question and allows delivery claims with an empty allowlist', async () => {
+    const h = harness(loadCourse(), 'public');
+    h.restart([], []);
+    const userId = 701;
+    const home = await h.send({ userId, chatId: userId, text: '/start' });
+    expect(home?.text).toContain('Армянский');
+    await h.send({ userId, chatId: userId, action: 'menu:practice' });
+    await h.answer(true, NOW, userId);
+    expect(await h.state(userId)).toMatchObject({ userId, chatId: userId, attempts: 1, correct: 1 });
+    const pending = await h.engine.handle(h.event({ userId, chatId: userId, text: '/progress' }));
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({ userId, chatId: userId });
+    expect(await h.engine.claim(userId, pending[0]!.id)).toBe(true);
+    expect(await h.engine.claim(userId + 1, pending[0]!.id)).toBe(false);
+  });
+
+  it('still rejects groups, cross-user chat IDs and invalid user IDs', async () => {
+    const h = harness(loadCourse(), 'public');
+    h.restart([], []);
+    for (const input of [
+      { userId: 701, chatId: -100 }, { userId: 701, chatId: 702 },
+      { userId: 0, chatId: 0 }, { userId: -1, chatId: -1 },
+      { userId: 1.5, chatId: 1.5 }, { userId: Number.MAX_SAFE_INTEGER + 1, chatId: Number.MAX_SAFE_INTEGER + 1 },
+    ]) {
+      expect(await h.engine.handle(h.event({ ...input, text: '/start' }))).toEqual([]);
+      if (input.userId <= 0 || !Number.isSafeInteger(input.userId)) expect(await h.engine.claim(input.userId, 'missing')).toBe(false);
+    }
+    expect(await h.store.list('u_')).toEqual([]);
+  });
+
+  it('keeps public users isolated and reserves administrative information for explicit admins', async () => {
+    const h = harness(loadCourse(), 'public');
+    h.restart([], [999]);
+    for (const userId of [701, 702]) await h.send({ userId, chatId: userId, action: 'menu:practice' });
+    const first = await h.session(701);
+    const second = await h.session(702);
+    await h.send({ userId: 702, chatId: 702, action: `answer:${first.id}:0:0` });
+    expect(await h.session(701)).toEqual(first);
+    expect(await h.session(702)).toEqual(second);
+    await h.answer(true, NOW, 701);
+    expect((await h.state(701))?.attempts).toBe(1);
+    expect((await h.state(702))?.attempts).toBe(0);
+    const denied = await h.send({ userId: 701, chatId: 701, text: '/admin' });
+    expect(denied?.text).not.toContain('ADMIN_USER_IDS');
+    const admin = await h.send({ userId: 999, chatId: 999, text: '/admin' });
+    expect(admin?.text).toContain('Доступ открыт всем');
+    expect(admin?.text).toContain('ADMIN_USER_IDS');
+    for (const id of ['701', '702', '999']) expect(admin?.text).not.toContain(id);
+  });
+
+  it('stops access and scheduled deliveries when a formerly public user is excluded by private mode', async () => {
+    const h = harness(loadCourse(), 'public');
+    h.restart([], []);
+    await h.send({ userId: 701, chatId: 701, text: '/remind 19:00 Asia/Yerevan' });
+    h.restart([1], [], 'private');
+    expect(await h.engine.handle(h.event({ userId: 701, chatId: 701, text: '/start' }))).toEqual([]);
+    expect(await h.engine.maintenance(Date.parse('2026-10-28T15:00:00Z'))).toEqual([]);
+  });
+
+  it('discovers reminders on pages after the first 100 registered users and avoids transactions for idle users', async () => {
+    const h = harness(loadCourse(), 'public');
+    h.restart([], []);
+    for (let userId = 1000; userId < 1105; userId++) {
+      await h.send({ userId, chatId: userId, text: '/start' });
+    }
+    for (const userId of [1000, 1104]) {
+      await h.send({ userId, chatId: userId, text: '/remind 19:00 Asia/Yerevan' });
+    }
+    const pages = vi.spyOn(h.store, 'listPage');
+    const transactions = vi.spyOn(h.store, 'update');
+    const at = Date.parse('2026-10-28T15:00:00Z');
+    const pending = await h.engine.maintenance(at);
+    expect(pages).toHaveBeenCalledTimes(2);
+    expect(pages).toHaveBeenNthCalledWith(1, 'u_', { afterKey: undefined, limit: 100 });
+    expect(pages).toHaveBeenNthCalledWith(2, 'u_', { afterKey: 'u_1099', limit: 100 });
+    expect(transactions).toHaveBeenCalledTimes(2);
+    expect(pending.map(item => item.userId)).toEqual([1000, 1104]);
+    expect(pending.every(item => item.chatId === item.userId && item.id === 'reminder_2026-10-28')).toBe(true);
+    await h.acknowledge(pending);
+    transactions.mockClear();
+    expect(await h.engine.maintenance(at + 5 * MINUTE)).toEqual([]);
+    expect(transactions).not.toHaveBeenCalled();
+  });
+
+  it('expires public exams and retries pending messages independently of the allowlist', async () => {
+    const h = harness(loadCourse(), 'public');
+    h.restart([], []);
+    await h.send({ userId: 701, chatId: 701, action: 'start:exam' });
+    const session = await h.session(701);
+    const message = await h.engine.handle(h.event({ userId: 702, chatId: 702, text: '/start' }));
+    h.restart([], []);
+    const pending = await h.engine.maintenance(NOW + 60 * MINUTE);
+    expect(pending).toHaveLength(2);
+    expect(pending.find(item => item.userId === 701)?.id).toBe(`timeout_${session.id}`);
+    expect(pending.find(item => item.userId === 702)).toEqual(message[0]);
+    expect((await h.state(701))?.exams).toEqual([expect.objectContaining({ timedOut: true, total: 33 })]);
+  });
+
+  it('ignores malformed and mismatched public records without mixing user deliveries', async () => {
+    const h = harness(loadCourse(), 'public');
+    h.restart([], []);
+    await h.send({ userId: 700, chatId: 700, text: '/remind 19:00 Asia/Yerevan' });
+    const template = (await h.state(700))!;
+    const records: Array<[string, unknown]> = [
+      ['u_bad', { schema: 1 }],
+      ['u_000700', template],
+      ['u_701', template],
+      ['u_0', { ...template, userId: 0, chatId: 0 }],
+      ['u_702', { ...template, userId: 702, chatId: 703 }],
+      ['u_704', { ...template, userId: 704, chatId: 704, reminders: { ...template.reminders, timeZone: 'Invalid/Zone' } }],
+      ['u_705', { ...template, userId: 705, chatId: 705, session: {} }],
+      ['u_706', { ...template, userId: 706, chatId: 706, outbox: [{ id: 'wrong', userId: 700, chatId: 700, view: { text: 'wrong user' } }] }],
+    ];
+    for (const [key, state] of records) await h.store.update(key, () => ({ state, result: undefined }));
+    const pending = await h.engine.maintenance(Date.parse('2026-10-28T15:00:00Z'));
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({ userId: 700, chatId: 700, id: 'reminder_2026-10-28' });
+    expect(await h.engine.handle(h.event({ userId: 701, chatId: 701, text: '/start' }))).toEqual([]);
+    expect(await h.engine.claim(701, pending[0]!.id)).toBe(false);
+  });
+
+  it('rechecks a public user atomically when reminder preferences change after the page was read', async () => {
+    const h = harness(loadCourse(), 'public');
+    h.restart([], []);
+    await h.send({ userId: 701, chatId: 701, text: '/remind 19:00 Asia/Yerevan' });
+    const listPage = h.store.listPage.bind(h.store);
+    vi.spyOn(h.store, 'listPage').mockImplementationOnce(async (prefix, options) => {
+      const page = await listPage(prefix, options);
+      await h.store.update('u_701', raw => {
+        const user = raw as UserState;
+        user.reminders.enabled = false;
+        return { state: user, result: undefined };
+      });
+      return page;
+    });
+    expect(await h.engine.maintenance(Date.parse('2026-10-28T15:00:00Z'))).toEqual([]);
+    expect((await h.state(701))?.reminders.lastSentDate).toBeNull();
   });
 });
 

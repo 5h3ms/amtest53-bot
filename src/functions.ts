@@ -17,11 +17,13 @@ const botToken = defineSecret('BOT_TOKEN');
 const webhookSecret = defineSecret('WEBHOOK_SECRET');
 const allowedIds = defineSecret('ALLOWED_USER_IDS');
 const adminIds = defineSecret('ADMIN_USER_IDS');
+const accessMode = defineSecret('ACCESS_MODE');
 
 function createRuntime() {
   assertProductionProject();
   const config = readCommonConfig({
     BOT_TOKEN: botToken.value(),
+    ACCESS_MODE: accessMode.value(),
     ALLOWED_USER_IDS: allowedIds.value(),
     ADMIN_USER_IDS: adminIds.value(),
   });
@@ -29,6 +31,7 @@ function createRuntime() {
   const engine = new LearningEngine({
     store: new FirestoreStateStore(getFirestore(app)),
     course: loadCourse(),
+    accessMode: config.accessMode,
     allowedUserIds: config.allowedUserIds,
     adminUserIds: config.adminUserIds,
   });
@@ -58,7 +61,7 @@ export const telegramWebhook = onRequest({
   timeoutSeconds: 30,
   invoker: 'public',
   cors: false,
-  secrets: [botToken, webhookSecret, allowedIds, adminIds],
+  secrets: [botToken, webhookSecret, allowedIds, adminIds, accessMode],
 }, async (request, response) => {
   if (request.method !== 'POST') {
     response.set('Allow', 'POST').status(405).send('Method not allowed');
@@ -94,7 +97,7 @@ export const maintenanceSchedule = onSchedule({
   maxInstances: 1,
   timeoutSeconds: 120,
   retryCount: 0,
-  secrets: [botToken, allowedIds, adminIds],
+  secrets: [botToken, allowedIds, adminIds, accessMode],
 }, async () => {
   try {
     const { engine, bot } = await getRuntime();

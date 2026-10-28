@@ -8,6 +8,16 @@ export interface StateRecord {
   state: unknown;
 }
 
+export interface StatePageOptions {
+  afterKey?: string;
+  limit?: number;
+}
+
+export interface StatePage {
+  records: StateRecord[];
+  nextCursor: string | null;
+}
+
 /**
  * State must consist of JSON values. Updaters must be synchronous and pure:
  * Firestore can invoke them more than once when retrying a transaction.
@@ -18,12 +28,15 @@ export interface StateStore {
     fn: (current: unknown | null) => { state: unknown; result: T },
   ): Promise<T>;
   list(prefix: string): Promise<StateRecord[]>;
+  /** Exclusive key cursor; each call reads a fresh page rather than a scan-wide snapshot. */
+  listPage(prefix: string, options?: StatePageOptions): Promise<StatePage>;
   close?(): Promise<void>;
 }
 
 const KEY_PATTERN = /^[a-zA-Z0-9_-]+$/;
 const PREFIX_PATTERN = /^[a-zA-Z0-9_-]*$/;
 const MAX_LIST_RECORDS = 1_000;
+const DEFAULT_PAGE_SIZE = 100;
 // Leave room for the document name, keys and envelope under Firestore's 1 MiB limit.
 const MAX_FIRESTORE_STATE_BYTES = 900 * 1024;
 
@@ -37,6 +50,33 @@ function validatePrefix(prefix: string): void {
   if (typeof prefix !== "string" || !PREFIX_PATTERN.test(prefix) || prefix !== prefix.trim()) {
     throw new Error("State prefix must contain only letters, digits, underscores or hyphens.");
   }
+}
+
+function validatePageOptions(prefix: string, options: StatePageOptions): { afterKey?: string; limit: number } {
+  validatePrefix(prefix);
+  if (typeof options !== "object" || options === null || Array.isArray(options)) {
+    throw new Error("State page options must be an object.");
+  }
+  const limit = options.limit === undefined ? DEFAULT_PAGE_SIZE : options.limit;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_LIST_RECORDS) {
+    throw new Error("State page limit must be a safe integer between 1 and 1000.");
+  }
+  if (options.afterKey !== undefined) {
+    validateKey(options.afterKey);
+    if (!options.afterKey.startsWith(prefix)) {
+      throw new Error("State page cursor must match the requested prefix.");
+    }
+  }
+  return { afterKey: options.afterKey, limit };
+}
+
+function pageFromRecords(records: ReadonlyMap<string, unknown>, prefix: string, options: { afterKey?: string; limit: number }): StatePage {
+  const keys = [...records.keys()]
+    .filter(key => key.startsWith(prefix) && (options.afterKey === undefined || key > options.afterKey))
+    .sort()
+    .slice(0, options.limit + 1);
+  const page = keys.slice(0, options.limit).map(key => ({ key, state: cloneJson(records.get(key)) }));
+  return { records: page, nextCursor: keys.length > options.limit ? page[page.length - 1]!.key : null };
 }
 
 function validateJson(value: unknown, ancestors = new Set<object>()): void {
@@ -129,6 +169,11 @@ export class MemoryStateStore extends SerializedStore implements StateStore {
         .slice(0, MAX_LIST_RECORDS)
         .map(([key, state]) => ({ key, state: cloneJson(state) })),
     );
+  }
+
+  async listPage(prefix: string, options: StatePageOptions = {}): Promise<StatePage> {
+    const validated = validatePageOptions(prefix, options);
+    return this.serialize(() => pageFromRecords(this.records, prefix, validated));
   }
 }
 
@@ -240,6 +285,14 @@ export class FileStateStore extends SerializedStore implements StateStore {
         .map(([key, state]) => ({ key, state: cloneJson(state) }));
     });
   }
+
+  async listPage(prefix: string, options: StatePageOptions = {}): Promise<StatePage> {
+    const validated = validatePageOptions(prefix, options);
+    return this.serialize(async () => {
+      await this.load();
+      return pageFromRecords(this.records, prefix, validated);
+    });
+  }
 }
 
 function validateFirestoreStateSize(stateJson: string): void {
@@ -302,5 +355,21 @@ export class FirestoreStateStore implements StateStore {
       validateKey(document.id);
       return { key: document.id, state: parseFirestoreState(document.id, document.data()) };
     });
+  }
+
+  async listPage(prefix: string, options: StatePageOptions = {}): Promise<StatePage> {
+    const { afterKey, limit } = validatePageOptions(prefix, options);
+    const collection = this.db.collection("botState");
+    const scoped = prefix
+      ? collection.where(FieldPath.documentId(), ">=", prefix).where(FieldPath.documentId(), "<=", `${prefix}\uf8ff`)
+      : collection;
+    const ordered = scoped.orderBy(FieldPath.documentId());
+    const query = afterKey === undefined ? ordered : ordered.startAfter(afterKey);
+    const snapshot = await query.limit(limit + 1).get();
+    const records = snapshot.docs.slice(0, limit).map(document => {
+      validateKey(document.id);
+      return { key: document.id, state: parseFirestoreState(document.id, document.data()) };
+    });
+    return { records, nextCursor: snapshot.docs.length > limit ? records[records.length - 1]!.key : null };
   }
 }

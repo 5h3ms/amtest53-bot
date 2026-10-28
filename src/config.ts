@@ -12,8 +12,11 @@ export class ConfigurationError extends Error {
   }
 }
 
+export type AccessMode = 'private' | 'public';
+
 export interface CommonConfig {
   token: string;
+  accessMode: AccessMode;
   allowedUserIds: number[];
   adminUserIds: number[];
 }
@@ -50,12 +53,16 @@ export function parseUserIds(value: string | undefined, name: string, required =
 
 export function readCommonConfig(env: NodeJS.ProcessEnv = process.env): CommonConfig {
   const token = readBotToken(env.BOT_TOKEN);
-  const allowedUserIds = parseUserIds(env.ALLOWED_USER_IDS, 'ALLOWED_USER_IDS', true);
+  const accessMode = env.ACCESS_MODE === undefined ? 'private' : env.ACCESS_MODE.trim();
+  if (accessMode !== 'private' && accessMode !== 'public') {
+    throw new ConfigurationError('ACCESS_MODE должен быть private или public.');
+  }
+  const allowedUserIds = parseUserIds(env.ALLOWED_USER_IDS, 'ALLOWED_USER_IDS', accessMode === 'private');
   const adminUserIds = parseUserIds(env.ADMIN_USER_IDS, 'ADMIN_USER_IDS');
-  if (adminUserIds.some((id) => !allowedUserIds.includes(id))) {
+  if (accessMode === 'private' && adminUserIds.some((id) => !allowedUserIds.includes(id))) {
     throw new ConfigurationError('Каждый ADMIN_USER_IDS должен также входить в ALLOWED_USER_IDS.');
   }
-  return { token, allowedUserIds, adminUserIds };
+  return { token, accessMode, allowedUserIds, adminUserIds };
 }
 
 export function readLocalConfig(env: NodeJS.ProcessEnv = process.env): LocalConfig {

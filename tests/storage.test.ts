@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import type { Firestore } from "firebase-admin/firestore";
 import { afterEach, describe, expect, it } from "vitest";
-import { FileStateStore, FirestoreStateStore, MemoryStateStore, type StateStore } from "../src/storage.js";
+import { FileStateStore, FirestoreStateStore, MemoryStateStore, type StateRecord, type StateStore } from "../src/storage.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -174,6 +174,7 @@ function firestoreHarness() {
       expect(name).toBe("botState");
       const bounds: Array<{ operator: string; value: string }> = [];
       let maximum = Infinity;
+      let afterKey: string | undefined;
       const query = {
         doc: (id: string): Reference => ({ id }),
         where(_field: unknown, operator: string, value: string) {
@@ -181,10 +182,12 @@ function firestoreHarness() {
           return query;
         },
         orderBy() { return query; },
+        startAfter(value: string) { afterKey = value; return query; },
         limit(value: number) { maximum = value; return query; },
         async get() {
           return {
             docs: [...documents.entries()]
+              .filter(([id]) => afterKey === undefined || id > afterKey)
               .filter(([id]) => bounds.every(({ operator, value }) => operator === ">=" ? id >= value : id <= value))
               .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
               .slice(0, maximum)
@@ -211,6 +214,81 @@ function firestoreHarness() {
   };
   return { documents, store: new FirestoreStateStore(db as unknown as Firestore) };
 }
+
+const paginationFactories: Array<{ name: string; create: (records: StateRecord[]) => Promise<StateStore> }> = [
+  { name: "memory", create: async records => {
+    const store = new MemoryStateStore();
+    for (const record of records) await store.update(record.key, () => ({ state: record.state, result: null }));
+    return store;
+  } },
+  { name: "file", create: async records => {
+    const nestedFile = await temporaryFile();
+    const file = join(dirname(dirname(nestedFile)), "pages.json");
+    await writeFile(file, JSON.stringify({ version: 1, records: Object.fromEntries(records.map(record => [record.key, record.state])) }), "utf8");
+    return new FileStateStore(file);
+  } },
+  { name: "Firestore adapter", create: async records => {
+    const { store, documents } = firestoreHarness();
+    for (const record of records) {
+      documents.set(record.key, { key: record.key, version: 1, stateJson: JSON.stringify(record.state) });
+    }
+    return store;
+  } },
+];
+
+describe.each(paginationFactories)("$name cursor pagination", ({ create }) => {
+  it("uses exclusive lexical cursors, isolates prefixes and detects a full final page", async () => {
+    const store = await create(["u_a", "u_2", "u_10", "u_1", "meta_1"]
+      .map(key => ({ key, state: { values: [key] } })));
+    const first = await store.listPage("u_", { limit: 2 });
+    expect(first.records.map(record => record.key)).toEqual(["u_1", "u_10"]);
+    expect(first.nextCursor).toBe("u_10");
+    const last = await store.listPage("u_", { afterKey: first.nextCursor!, limit: 2 });
+    expect(last.records.map(record => record.key)).toEqual(["u_2", "u_a"]);
+    expect(last.nextCursor).toBeNull();
+    expect(await store.listPage("u_", { afterKey: "u_a", limit: 2 })).toEqual({ records: [], nextCursor: null });
+    expect((await store.listPage("u_", { afterKey: "u_15", limit: 1 })).records[0]?.key).toBe("u_2");
+    expect((await store.listPage("", { limit: 1 })).records[0]?.key).toBe("meta_1");
+    expect(await store.listPage("missing_")).toEqual({ records: [], nextCursor: null });
+    (first.records[0]!.state as { values: string[] }).values.push("mutated");
+    expect((await store.listPage("u_", { limit: 1 })).records[0]?.state).toEqual({ values: ["u_1"] });
+  });
+
+  it("traverses beyond 1000 records without omissions or duplicates while preserving list()'s cap", async () => {
+    const records = Array.from({ length: 1007 }, (_, index) => ({
+      key: `u_${String(index).padStart(4, "0")}`, state: { index },
+    }));
+    const store = await create([...records].reverse().concat([{ key: "meta_progress", state: { index: -1 } }]));
+    const first = await store.listPage("u_");
+    expect(first.records).toHaveLength(100);
+    expect(first.nextCursor).toBe(records[99]!.key);
+    const visited: StateRecord[] = [];
+    let afterKey: string | undefined;
+    do {
+      const page = await store.listPage("u_", { afterKey, limit: 137 });
+      visited.push(...page.records);
+      afterKey = page.nextCursor ?? undefined;
+    } while (afterKey !== undefined);
+    expect(visited).toEqual(records);
+    expect(new Set(visited.map(record => record.key)).size).toBe(records.length);
+    expect(await store.list("u_")).toEqual(records.slice(0, 1000));
+    const maximum = await store.listPage("u_", { limit: 1000 });
+    expect(maximum.records).toHaveLength(1000);
+    expect(maximum.nextCursor).toBe(records[999]!.key);
+  });
+
+  it("rejects invalid limits, prefixes and cursors before reading any records", async () => {
+    const store = await create([]);
+    for (const limit of [0, -1, 1.5, 1001, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "2", null]) {
+      await expect(store.listPage("u_", { limit: limit as number })).rejects.toThrow("State page limit");
+    }
+    for (const afterKey of ["", "../users", "u/1", "u_1\n", "meta_1"]) {
+      await expect(store.listPage("u_", { afterKey })).rejects.toThrow(/State (key|page cursor)/);
+    }
+    await expect(store.listPage("../")).rejects.toThrow("State prefix");
+    await expect(store.listPage("u_", null as never)).rejects.toThrow("State page options");
+  });
+});
 
 describe("Firestore JSON document representation", () => {
   it("round-trips nested button rows and keeps returned objects isolated", async () => {

@@ -21,6 +21,7 @@ async function main(): Promise<void> {
     const engine = new LearningEngine({
       store,
       course: loadCourse(),
+      accessMode: config.accessMode,
       allowedUserIds: config.allowedUserIds,
       adminUserIds: config.adminUserIds,
     });
